@@ -1,0 +1,4 @@
+# Pinned so the CI cannot turn red on untouched code when the tool releases a
+# new major version. Keep this file and the version in .github/workflows/go.yml
+# in step.
+version: "2"
