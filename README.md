@@ -611,7 +611,10 @@ and the last valid one is kept.
 ### Commands
 
 ```
-gnovisor init     -home <dir> -binary <gnoland> -gnoroot <dir> -chain-id <id> [-ledger-url <url|file>]
+gnovisor init     -home <dir> -chain-id <id> -version <vX.Y.Z> [-ledger-url <url|file>]
+                                 the usual way: binary from the official image, GNOROOT cloned
+gnovisor init     -home <dir> -chain-id <id> -binary <gnoland> -gnoroot <dir> [-ledger-url <url|file>]
+                                 from a release binary and a GNOROOT you already have
 gnovisor run      -home <dir>    run and supervise the node, the ExecStart of the service
 gnovisor status   -home <dir>    version in service, last halt, node height, programmed halt
 gnovisor prepare  -home <dir>    prepare the version of the programmed halt now
