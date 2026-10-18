@@ -521,66 +521,213 @@ its own service.
 
 ---
 
-## Running the node in Docker
+## Installation with Docker
 
-GnoVisor can also supervise a node that runs in a Docker container, from the
-official `gnoland` image gno.land publishes for every version
-(`ghcr.io/gnolang/gno/gnoland:<version>`). Everything else is the same as
-for a node run from a binary: the ledger, the vote, the preparation ahead of
-the halt, the backup, the switch, the commands. GnoVisor stays a binary on
-the machine; at a voted halt it stops the container and starts the image of
-the new version instead of the new binary.
+For a node that runs in a Docker container. GnoVisor itself is the same
+`gnovisor` binary as in the Linux installation, installed on the machine:
+there is no separate download and no Docker image of GnoVisor. What runs in
+Docker is the node, from the official `gnoland` image gno.land publishes for
+every version, `ghcr.io/gnolang/gno/gnoland:<version>`. At a voted halt,
+GnoVisor stops the container and starts the image of the new version, where
+the Linux installation starts the new binary. Everything else works the same:
+the ledger, the vote, the preparation ahead of the halt, the backup, the
+commands.
 
 The image is gno.land's own: it holds `gnoland` and its `GNOROOT` at the same
 version, so nothing is extracted or cloned. GnoVisor pulls it by the digest
-the ledger gives, or by its tag while the ledger gives none yet, and pins it
-by the digest Docker read.
+the ledger gives, or by its tag while the ledger gives none yet, and runs it
+pinned by the digest Docker read.
 
-### What changes from the Linux installation
+### Requirements
 
-- **Docker is required**, and the user that runs GnoVisor must be allowed to
-  use it (member of the `docker` group):
-
-  ```bash
-  sudo usermod -aG docker ${NODE_USER}
-  ```
-
-- **Step 3**: initialise with `-runtime docker`. GnoVisor pulls the image of
-  `${GNO_VERSION}` instead of fetching a binary and a `GNOROOT`:
+- **A gno.land node that already runs**, synced or syncing, with its node
+  directory (the `--data-dir` of `gnoland start`).
+- Linux, amd64 or arm64.
+- **Docker installed**, and the system account that runs the node allowed to
+  use it, as a member of the `docker` group:
 
   ```bash
-  sudo -u ${NODE_USER} gnovisor init -home ${NODE_HOME} -chain-id ${CHAIN_ID} -version ${GNO_VERSION} -runtime docker
+  docker version
   ```
 
-- **Step 4**: `gnovisor.toml` holds `runtime = "docker"`. `node_args` are the
-  same as for a binary. The container sees the node directory at the same
-  path, and nothing else: a file outside it, such as a genesis file, is
-  mounted through `docker_args`, for example
-  `docker_args = ["--volume", "/home/gnoland/genesis.json:/home/gnoland/genesis.json:ro"]`.
-- **Step 5**: stop and disable the service or the container that runs the
-  node today. The GnoVisor unit is the same.
+- **Outbound HTTPS** to `raw.githubusercontent.com`, for the ledger, and to
+  `ghcr.io`, for the images. Git and Go are not needed.
+- **The default database of the node**, `db_backend = "pebbledb"` in its
+  `config.toml` (or `goleveldb`): the image is built without CGO.
+- **Disk space for the backups**, as in the Linux installation.
 
-### How the container runs
+### Step 1 - Describe your node
 
-- One container per node, named `gnovisor-<chain id>-<8 hex>` by default
-  (`container_name` to change it). A container of that name left by an
-  earlier run is removed before the node starts.
-- `--network host`: the node keeps the RPC and p2p addresses it has in its
-  `config.toml`.
-- `--user`: the user that runs GnoVisor, so the files of the node directory
-  stay that user's.
-- The container is started attached: the node's output goes to GnoVisor's log
-  as with a binary, and the container is removed when it stops.
-- Stopping GnoVisor stops the container (`docker stop`, SIGTERM then SIGKILL
-  after `shutdown_grace`).
+The same variables as in the Linux installation, set once in the terminal you
+are working in:
 
-A version added by hand (see [Adding a version by hand](#adding-a-version-by-hand))
-is given as an image, pinned by digest, instead of a binary and a `GNOROOT`:
+```bash
+export CHAIN_ID=gnoland-1
+export NODE_USER=gnoland
+export NODE_HOME=/home/gnoland/gnoland-data
+export GNO_VERSION=v1.5.0
+```
+
+`NODE_HOME` is the node directory on the machine, the one holding `config/`,
+`secrets/` and `db/`. If your node runs in a container today, it is the host
+directory mounted into it, not the path inside the container.
+
+Let `NODE_USER` use Docker, and own the node directory: the container runs as
+that user, and files a container wrote as root would not be writable to it.
+
+```bash
+sudo usermod -aG docker ${NODE_USER}
+sudo chown -R ${NODE_USER}:${NODE_USER} ${NODE_HOME}
+```
+
+### Step 2 - Install the binary
+
+Exactly as in the Linux installation, step 2: the same release archive, the
+same command.
+
+### Step 3 - Initialise GnoVisor in the node directory
+
+```bash
+sudo -u ${NODE_USER} gnovisor init -home ${NODE_HOME} -chain-id ${CHAIN_ID} -version ${GNO_VERSION} -runtime docker
+```
+
+That command reads the ledger of the chain, pulls the image of
+`${GNO_VERSION}` by the digest the ledger gives, creates
+`${NODE_HOME}/gnovisor/` with that version in `genesis/`, and writes
+`gnovisor/gnovisor.toml` with `runtime = "docker"`. It changes nothing else in
+the node directory, and it refuses to run if `gnovisor/` already exists.
+
+### Step 4 - Configure
+
+```bash
+sudo -u ${NODE_USER} nano ${NODE_HOME}/gnovisor/gnovisor.toml
+```
+
+`node_args` and `rolling_window` are filled in as in the Linux installation,
+step 4. `node_args` are the arguments of `gnoland start`, written with the
+paths of the machine.
+
+The container sees the node directory at the same path as the machine, and
+nothing else. A file outside it, such as a genesis file, is mounted with
+`docker_args`:
+
+```toml
+docker_args = ["--volume", "/home/gnoland/genesis.json:/home/gnoland/genesis.json:ro"]
+```
+
+The container uses the network of the machine, so the node keeps the RPC and
+p2p addresses written in its `config.toml`: no port to publish.
+
+### Step 5 - Hand the node over to GnoVisor
+
+From now on GnoVisor starts the node. **What runs the node today must be
+stopped and kept from starting again**, otherwise two nodes would run on the
+same node directory. A systemd service:
+
+```bash
+sudo systemctl stop gnoland
+sudo systemctl disable gnoland
+```
+
+A container, here named `gnoland`:
+
+```bash
+docker stop gnoland
+docker update --restart=no gnoland
+```
+
+Create the GnoVisor unit. It is the Linux unit, started after Docker:
+
+```bash
+sudo tee /etc/systemd/system/gnovisor-${CHAIN_ID}.service > /dev/null <<EOF
+[Unit]
+Description=gnovisor - gno.land node supervisor for ${CHAIN_ID}
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+User=${NODE_USER}
+Group=${NODE_USER}
+Type=simple
+ExecStart=/usr/local/bin/gnovisor run -home ${NODE_HOME}
+Restart=always
+RestartSec=5
+TimeoutStopSec=180
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Then enable and start it:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now gnovisor-${CHAIN_ID}
+sudo systemctl status gnovisor-${CHAIN_ID}
+```
+
+### Step 6 - Check that it works
+
+The node's output goes to GnoVisor's log, as in the Linux installation:
+
+```bash
+sudo journalctl -u gnovisor-${CHAIN_ID} --no-hostname -f
+```
+
+The container is named `gnovisor-<chain id>-<8 hex>`, one per node directory
+(`container_name` in `gnovisor.toml` to choose another). It shows in Docker
+with the image it runs, pinned by digest:
+
+```bash
+docker ps --filter name=gnovisor-${CHAIN_ID}
+sudo -u ${NODE_USER} gnovisor status -home ${NODE_HOME}
+```
+
+### Docker management
+
+Manage the node through the GnoVisor service, never through Docker: the
+container belongs to GnoVisor. Stopping or removing it by hand is seen as a
+node that exited by itself: GnoVisor logs it and exits with an error, and
+systemd starts GnoVisor again, which starts the container again.
+
+```bash
+# Stop (stops the container too)
+sudo systemctl stop gnovisor-${CHAIN_ID}
+
+# Start
+sudo systemctl start gnovisor-${CHAIN_ID}
+
+# Restart (restarts the container too)
+sudo systemctl restart gnovisor-${CHAIN_ID}
+
+# Live logs
+sudo journalctl -u gnovisor-${CHAIN_ID} --no-hostname -f
+```
+
+When GnoVisor stops, it stops the container (`docker stop`, SIGTERM then
+SIGKILL after `shutdown_grace`), and the container is removed. A container of
+the same name left behind by an earlier run is removed before the node starts.
+
+Images of earlier versions stay on the machine: GnoVisor never deletes one.
+Remove those you no longer need with `docker image rm`.
+
+### Adding a version by hand
+
+As in the Linux installation, with the version given as an image, pinned by
+digest, instead of a binary and a `GNOROOT`:
 
 ```bash
 sudo -u ${NODE_USER} gnovisor add-upgrade -home ${NODE_HOME} \
   -version v1.6.1 -image registry.example/gnoland@sha256:<digest> -halt 250000
 ```
+
+### Updating GnoVisor
+
+Exactly as in the Linux installation, "Updating GnoVisor": only the binary is
+replaced, and restarting GnoVisor restarts the container.
 
 ---
 
@@ -672,7 +819,7 @@ for a default.
 | `shutdown_grace` | `2m` | time between SIGTERM and SIGKILL when stopping the node |
 | `halt_confirm` | `30s` | time without a new block, at a height that is neither a halt voted on the chain nor a past halt of the ledger, before GnoVisor reports a node stopped by its own configuration. A voted halt is handled at once |
 | `restart_timeout` | `10m` | longest wait for the first block after a switch, and for the RPC at start |
-| `runtime` | `binary` | `binary`, or `docker` for a node run in a container (see [Running the node in Docker](#running-the-node-in-docker)) |
+| `runtime` | `binary` | `binary`, or `docker` for a node run in a container (see [Installation with Docker](#installation-with-docker)) |
 | `docker` | `docker` | Docker mode only: the docker command |
 | `container_name` | `gnovisor-<chain id>-<8 hex>` | Docker mode only: the name of the node's container, one per node directory |
 | `docker_args` | none | Docker mode only: extra arguments for `docker run`, as a list of strings, such as a `--volume` for a file outside the node directory |
