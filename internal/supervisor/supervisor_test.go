@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/AviaOne/gnovisor/internal/config"
+	"github.com/AviaOne/gnovisor/internal/docker"
 	"github.com/AviaOne/gnovisor/internal/layout"
 	"github.com/AviaOne/gnovisor/internal/ledger"
 	"github.com/AviaOne/gnovisor/internal/local"
@@ -44,6 +45,9 @@ type control struct {
 func TestMain(m *testing.M) {
 	if os.Getenv("GNOVISOR_FAKE_NODE") == "1" {
 		os.Exit(fakeNode())
+	}
+	if os.Getenv("GNOVISOR_FAKE_DOCKER") == "1" {
+		os.Exit(fakeDocker())
 	}
 	os.Exit(m.Run())
 }
@@ -166,6 +170,8 @@ type harness struct {
 	height  string
 	nodeLog string
 	ledger  string
+	// dockerDir is the state of the fake docker, in Docker mode.
+	dockerDir string
 
 	mu   sync.Mutex
 	logs []string
@@ -194,6 +200,13 @@ func freePort(t *testing.T) string {
 // newHarness: releases are all known to the fake node; the ledger GnoVisor
 // reads holds the first `published` of them.
 func newHarness(t *testing.T, published int, releases ...*testutil.Release) *harness {
+	t.Helper()
+	return newHarnessMode(t, false, published, releases...)
+}
+
+// newHarnessMode builds the harness for a node run from a binary, or in a
+// container (dockerMode) through the fake docker of docker_test.go.
+func newHarnessMode(t *testing.T, dockerMode bool, published int, releases ...*testutil.Release) *harness {
 	t.Helper()
 	for _, r := range releases {
 		r.Binary = script(r.Version)
@@ -238,11 +251,16 @@ func newHarness(t *testing.T, published int, releases ...*testutil.Release) *har
 		BackupDir: filepath.Join(h.lay.Root, "backups"), ShutdownGrace: 2 * time.Second,
 		HaltConfirm: 200 * time.Millisecond, RestartTimeout: 3 * time.Second, RollingWindow: w,
 	}
+	o := prepare.Options{
+		Platform: "linux/amd64", AutoDownload: true, GnorootRepo: h.f.Repo, HTTPClient: h.f.Client(), Registry: h.f.Server.URL,
+	}
+	if dockerMode {
+		h.setupDocker()
+		o.Docker = &docker.Client{Bin: h.cfg.DockerBin}
+	}
 	// The genesis version, as `gnovisor init` leaves it.
 	l, _ := ledger.Parse(h.f.Ledger(1))
-	d, err := prepare.Version(context.Background(), h.lay, &l.Upgrades[0], prepare.Options{
-		Platform: "linux/amd64", AutoDownload: true, GnorootRepo: h.f.Repo, HTTPClient: h.f.Client(), Registry: h.f.Server.URL,
-	})
+	d, err := prepare.Version(context.Background(), h.lay, &l.Upgrades[0], o)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -497,8 +515,61 @@ func TestPendingHaltSurvivesARestartOfGnoVisor(t *testing.T) {
 	}
 }
 
+func TestLedgerHaltWithoutVoteDoesNotStopTheNode(t *testing.T) {
+	// D15: the vote is what triggers an update. The ledger lists v1.6.0 for
+	// a halt at 30, and GnoVisor reads the node at height 30, but no halt
+	// was voted there (none at all, or one moved to another height): the
+	// chain goes on, and so must the node, on its version.
+	for name, voted := range map[string]int64{"no vote": 0, "vote moved elsewhere": 1000} {
+		t.Run(name, func(t *testing.T) {
+			h := newHarness(t, 2, rel("genesis", "v1.5.0", 0), rel("upgrade", "v1.6.0", 30))
+			h.setControl(func(c *control) { c.HaltHeight = voted; c.Ranges["v1.5.0"] = [2]int64{1, 30} })
+			h.run()
+			// The node stays at 30 for a few polls, shorter than
+			// halt_confirm, then the chain goes on.
+			h.waitFor("height 30", func() bool { return h.chainHeight() == 30 })
+			time.Sleep(100 * time.Millisecond)
+			h.setControl(func(c *control) { c.Ranges["v1.5.0"] = [2]int64{1, 0} })
+			h.waitFor("blocks after 30", func() bool { return h.chainHeight() >= 40 })
+			if v := h.currentVersion(); v != "v1.5.0" {
+				t.Fatalf("current = %s: a halt the chain did not vote must change nothing", v)
+			}
+			if starts := h.nodeStarts(); strings.Join(starts, ",") != "v1.5.0" {
+				t.Fatalf("node runs = %v", starts)
+			}
+			if st := h.state(); st.LastHalt != 0 || st.Pending != nil {
+				t.Fatalf("state = %+v", st)
+			}
+		})
+	}
+}
+
+func TestVersionAddedByHandWithoutVoteDoesNotStopTheNode(t *testing.T) {
+	// D15 holds for a version added by hand for a halt: without the vote,
+	// the node goes on.
+	h := newHarness(t, 1, rel("genesis", "v1.5.0", 0))
+	h.setControl(func(c *control) { c.Ranges["v1.5.0"] = [2]int64{1, 30}; c.Ranges["v1.5.9"] = [2]int64{31, 0} })
+	h.addLocal("v1.5.9", 30, false)
+	h.run()
+	h.waitFor("height 30", func() bool { return h.chainHeight() == 30 })
+	time.Sleep(100 * time.Millisecond)
+	h.setControl(func(c *control) { c.Ranges["v1.5.0"] = [2]int64{1, 0} })
+	h.waitFor("blocks after 30", func() bool { return h.chainHeight() >= 40 })
+	if v := h.currentVersion(); v != "v1.5.0" || len(h.nodeStarts()) != 1 {
+		t.Fatalf("current = %s, runs %v", v, h.nodeStarts())
+	}
+}
+
 func TestSyncFromGenesisCrossesEveryPastHalt(t *testing.T) {
-	h := newHarness(t, 3, rel("genesis", "v1.5.0", 0), rel("upgrade", "v1.6.0", 20), rel("upgrade", "v1.7.0", 40))
+	// Past halts carry their halt_time in the ledger: they happened on the
+	// chain, so a node replaying it stops at each of them, whatever halt the
+	// chain parameter names today.
+	past := func(v string, halt int64) *testutil.Release {
+		r := rel("upgrade", v, halt)
+		r.Halted = true
+		return r
+	}
+	h := newHarness(t, 3, rel("genesis", "v1.5.0", 0), past("v1.6.0", 20), past("v1.7.0", 40))
 	h.cfg.Backup = false
 	// The chain parameter carries the last halt, as on mainnet today
 	// (halt_height 162200 long after it happened).
@@ -518,7 +589,7 @@ func TestLocalHaltIsNotAnUpgrade(t *testing.T) {
 	// The node stops at 12 by itself (a halt_height in its config.toml).
 	h.setControl(func(c *control) { c.Ranges["v1.5.0"] = [2]int64{1, 12} })
 	h.run()
-	h.waitFor("warning", func() bool { return h.logged("neither the chain halt nor a ledger halt") })
+	h.waitFor("warning", func() bool { return h.logged("neither a halt voted on the chain nor a past halt of the ledger") })
 	time.Sleep(300 * time.Millisecond)
 	if h.currentVersion() != "v1.5.0" || len(h.nodeStarts()) != 1 {
 		t.Fatal("a local halt must change nothing")

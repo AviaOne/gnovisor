@@ -8,7 +8,7 @@ package version
 // Version is the published version. A release build overwrites it from the
 // exact tag on HEAD (Makefile, -ldflags -X); any other build keeps this
 // default.
-var Version = "1.0.0"
+var Version = "1.1.0"
 
 // Attribution is the notice every copy and every modified version must keep
 // (NOTICE.md, additional term under section 7 b of the AGPL-3.0).

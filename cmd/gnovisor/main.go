@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/AviaOne/gnovisor/internal/config"
+	"github.com/AviaOne/gnovisor/internal/docker"
 	"github.com/AviaOne/gnovisor/internal/layout"
 	"github.com/AviaOne/gnovisor/internal/ledger"
 	"github.com/AviaOne/gnovisor/internal/local"
@@ -39,12 +40,13 @@ const usage = version.Attribution + `
 usage: gnovisor <command> [flags]
 
 commands:
-  init     -home <node dir> -chain-id <id> -version <vX.Y.Z> [-ledger-url <url|file>]
+  init     -home <node dir> -chain-id <id> -version <vX.Y.Z> [-runtime docker] [-ledger-url <url|file>]
            (or -binary <gnoland> -gnoroot <dir> instead of -version)
   run      -home <node dir>     run and supervise the node (systemd ExecStart)
   status   -home <node dir>     version in service, programmed halt, prepared version, last halt
   prepare  -home <node dir>     prepare the version of the programmed halt now
-  add-upgrade -home <node dir> -version <vX.Y.Z> -binary <gnoland> -gnoroot <dir> (-halt <height> | -rolling [-now])
+  add-upgrade -home <node dir> -version <vX.Y.Z> (-binary <gnoland> -gnoroot <dir> | -image <repo@sha256:...>)
+              (-halt <height> | -rolling [-now])
                                 add a version received outside the ledger (a private security fix)
   version                       print the version of gnovisor
 `
@@ -176,6 +178,7 @@ func cmdInit(args []string) error {
 	root := fs.String("gnoroot", "", "with -binary: GNOROOT of that binary, a git checkout of gnolang/gno")
 	chainID := fs.String("chain-id", "", "chain id, for example gnoland-1")
 	ledgerURL := fs.String("ledger-url", "", "upgrades.json URL or file (default: the chain's ledger on gnolang/gno)")
+	runtimeFlag := fs.String("runtime", config.RuntimeBinary, `"binary", or "docker" for a node run in a container from the gnoland image`)
 	_ = fs.Parse(args)
 	h, err := absHome(*home)
 	if err != nil {
@@ -184,6 +187,10 @@ func cmdInit(args []string) error {
 	switch {
 	case *chainID == "":
 		return errors.New("-chain-id is required")
+	case *runtimeFlag != config.RuntimeBinary && *runtimeFlag != config.RuntimeDocker:
+		return errors.New(`-runtime is "binary" or "docker"`)
+	case *runtimeFlag == config.RuntimeDocker && *ver == "":
+		return errors.New("-runtime docker goes with -version: the version is the gnoland image the ledger names")
 	case *ver != "" && (*bin != "" || *root != ""):
 		return errors.New("give -version, or -binary and -gnoroot, not both")
 	case *ver == "" && (*bin == "" || *root == ""):
@@ -207,7 +214,7 @@ func cmdInit(args []string) error {
 		return err
 	}
 	if *ver != "" {
-		return initFromLedger(ctx, lay, l, *ver, h, *chainID)
+		return initFromLedger(ctx, lay, l, *ver, h, *chainID, *runtimeFlag)
 	}
 	sum, err := layout.SHA256File(*bin)
 	if err != nil {
@@ -245,7 +252,7 @@ func cmdInit(args []string) error {
 	if err := layout.WriteInfo(gen, layout.Info{Version: e.Version, Commit: e.Commit, SHA256: sum}); err != nil {
 		return err
 	}
-	return finishInit(tmp, lay, h, *chainID, e.Version, sum)
+	return finishInit(tmp, lay, h, *chainID, config.RuntimeBinary, e.Version, sum)
 }
 
 // Where `init -version` fetches from; replaced by the tests only.
@@ -253,10 +260,11 @@ var (
 	initRegistry    = ""
 	initClient      *http.Client
 	initGnorootRepo = config.DefaultGnorootRepo
+	initDocker      = docker.Client{}
 )
 
 // initFromLedger prepares the genesis version from the ledger alone.
-func initFromLedger(ctx context.Context, lay layout.Layout, l *ledger.Ledger, ver, h, chainID string) error {
+func initFromLedger(ctx context.Context, lay layout.Layout, l *ledger.Ledger, ver, h, chainID, runtime string) error {
 	e, ok := l.Entry(ver)
 	if !ok {
 		return fmt.Errorf("%s is not in the ledger of %s", ver, chainID)
@@ -268,23 +276,32 @@ func initFromLedger(ctx context.Context, lay layout.Layout, l *ledger.Ledger, ve
 	if err := os.MkdirAll(tmp, 0o755); err != nil {
 		return err
 	}
-	info, err := prepare.Into(ctx, filepath.Join(tmp, "genesis"), e, prepare.Options{
+	o := prepare.Options{
 		Platform: platform(), AutoDownload: true, GnorootRepo: initGnorootRepo,
 		HTTPClient: initClient, Registry: initRegistry, Log: logf,
-	})
+	}
+	if runtime == config.RuntimeDocker {
+		d := initDocker
+		o.Docker = &d
+	}
+	info, err := prepare.Into(ctx, filepath.Join(tmp, "genesis"), e, o)
 	if err != nil {
 		_ = os.RemoveAll(tmp)
 		return err
 	}
-	return finishInit(tmp, lay, h, chainID, e.Version, info.SHA256)
+	id := info.SHA256
+	if info.Docker() {
+		id = info.ImageRef
+	}
+	return finishInit(tmp, lay, h, chainID, runtime, e.Version, id)
 }
 
 // finishInit adds current and gnovisor.toml to tmp and moves it in place.
-func finishInit(tmp string, lay layout.Layout, h, chainID, ver, sum string) error {
+func finishInit(tmp string, lay layout.Layout, h, chainID, runtime, ver, sum string) error {
 	if err := os.Symlink("genesis", filepath.Join(tmp, "current")); err != nil {
 		return err
 	}
-	if err := os.WriteFile(filepath.Join(tmp, config.FileName), []byte(config.Template(h, chainID)), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(tmp, config.FileName), []byte(config.Template(h, chainID, runtime)), 0o644); err != nil {
 		return err
 	}
 	if err := os.Rename(tmp, lay.Root); err != nil {
@@ -376,7 +393,11 @@ func cmdStatus(args []string) error {
 	if err != nil {
 		return err
 	}
-	fmt.Printf("version in service: %s (sha256 %s)\n", info.Version, info.SHA256)
+	if info.Docker() {
+		fmt.Printf("version in service: %s (image %s)\n", info.Version, info.ImageRef)
+	} else {
+		fmt.Printf("version in service: %s (sha256 %s)\n", info.Version, info.SHA256)
+	}
 	fmt.Printf("last halt handled:  %d\n", st.LastHalt)
 	if st.Pending != nil {
 		fmt.Printf("pending halt:       %d, the node stays stopped until its version is ready\n", st.Pending.Height)
@@ -464,9 +485,13 @@ func cmdPrepare(args []string) error {
 	if !ok {
 		return fmt.Errorf("no ledger entry for the halt at height %d yet", halt.Height)
 	}
-	dir, err := prepare.Version(ctx, layout.New(h), e, prepare.Options{
+	o := prepare.Options{
 		Platform: platform(), AutoDownload: cfg.AutoDownload, GnorootRepo: cfg.GnorootRepo, Log: logf,
-	})
+	}
+	if cfg.Docker() {
+		o.Docker = &docker.Client{Bin: cfg.DockerBin}
+	}
+	dir, err := prepare.Version(ctx, layout.New(h), e, o)
 	if err != nil {
 		return err
 	}
@@ -487,6 +512,7 @@ func cmdAddUpgrade(args []string) error {
 	ver := fs.String("version", "", "version of the binary, vMAJOR.MINOR.PATCH")
 	bin := fs.String("binary", "", "the gnoland binary received")
 	root := fs.String("gnoroot", "", "the GNOROOT of that binary")
+	img := fs.String("image", "", `runtime "docker": the gnoland image received, repository@sha256:<digest>`)
 	halt := fs.Int64("halt", 0, "the coordinated halt this version runs after")
 	rolling := fs.Bool("rolling", false, "a version installed without a halt, on the same MAJOR.MINOR")
 	now := fs.Bool("now", false, "with -rolling: install at the next poll instead of inside rolling_window")
@@ -496,8 +522,8 @@ func cmdAddUpgrade(args []string) error {
 		return err
 	}
 	switch {
-	case *ver == "" || *bin == "" || *root == "":
-		return errors.New("-version, -binary and -gnoroot are required")
+	case *ver == "":
+		return errors.New("-version is required")
 	case !semver.IsValid(*ver) || semver.Canonical(*ver) != *ver:
 		return fmt.Errorf("version %q is not of the form vMAJOR.MINOR.PATCH", *ver)
 	case *halt < 0:
@@ -516,6 +542,14 @@ func cmdAddUpgrade(args []string) error {
 	if err != nil {
 		return err
 	}
+	// The version in service tells how the node runs: a binary, or an image
+	// in a container (decision D17).
+	switch {
+	case cur.Docker() && (*img == "" || *bin != "" || *root != ""):
+		return errors.New(`the node runs in a container: give -image, not -binary or -gnoroot`)
+	case !cur.Docker() && (*bin == "" || *root == "" || *img != ""):
+		return errors.New("-binary and -gnoroot are required; -image is for a node run in a container")
+	}
 	if *rolling && (semver.Compare(*ver, cur.Version) <= 0 || semver.MajorMinor(*ver) != semver.MajorMinor(cur.Version)) {
 		return fmt.Errorf("a rolling version must be above %s on the same MAJOR.MINOR (%s)", cur.Version, semver.MajorMinor(cur.Version))
 	}
@@ -531,6 +565,13 @@ func cmdAddUpgrade(args []string) error {
 	}
 	if _, err := os.Lstat(lay.Upgrade(*ver)); err == nil {
 		return fmt.Errorf("%s already exists, nothing done", lay.Upgrade(*ver))
+	}
+	if cur.Docker() {
+		dockerBin := "docker"
+		if cfg, err := config.Load(h); err == nil {
+			dockerBin = cfg.DockerBin
+		}
+		return addImage(lay, f, *ver, *img, *halt, *rolling, *now, dockerBin)
 	}
 	if st, err := os.Stat(filepath.Join(*root, "gnovm", "stdlibs")); err != nil || !st.IsDir() {
 		return fmt.Errorf("%s has no gnovm/stdlibs: not a GNOROOT", *root)
@@ -573,6 +614,53 @@ func cmdAddUpgrade(args []string) error {
 		logf("added %s (sha256 %s), rolling, installed %s", *ver, sum, map[bool]string{true: "at the next poll", false: "inside rolling_window"}[*now])
 	} else {
 		logf("added %s (sha256 %s) for the halt at height %d", *ver, sum, *halt)
+	}
+	return nil
+}
+
+// addImage is add-upgrade for a node run in a container: the version is an
+// image received outside the ledger, pinned by digest, pulled by docker and
+// recorded in upgrades/<version>/version.json and local-upgrades.json.
+func addImage(lay layout.Layout, f local.File, ver, ref string, halt int64, rolling, now bool, dockerBin string) error {
+	repo, digest, err := docker.SplitDigest(ref)
+	if err != nil {
+		return fmt.Errorf("-image %q: %w", ref, err)
+	}
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
+	defer stop()
+	d := docker.Client{Bin: dockerBin}
+	if err := d.Pull(ctx, ref); err != nil {
+		return err
+	}
+	got, err := d.Digest(ctx, ref, repo)
+	if err != nil {
+		return err
+	}
+	if got != digest {
+		return fmt.Errorf("docker read image %s, -image says %s", got, digest)
+	}
+	if err := os.MkdirAll(lay.Upgrades(), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.MkdirTemp(lay.Upgrades(), "."+ver+".add-")
+	if err != nil {
+		return err
+	}
+	defer func() { _ = os.RemoveAll(tmp) }()
+	if err := layout.WriteInfo(tmp, layout.Info{Version: ver, Image: digest, Runtime: layout.RuntimeDocker, ImageRef: ref}); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, lay.Upgrade(ver)); err != nil {
+		return err
+	}
+	f.Upgrades = append(f.Upgrades, local.Entry{Version: ver, HaltHeight: halt, Now: now, Image: ref, Added: time.Now().UTC()})
+	if err := local.Write(lay, f); err != nil {
+		return err
+	}
+	if rolling {
+		logf("added %s (image %s), rolling, installed %s", ver, ref, map[bool]string{true: "at the next poll", false: "inside rolling_window"}[now])
+	} else {
+		logf("added %s (image %s) for the halt at height %d", ver, ref, halt)
 	}
 	return nil
 }

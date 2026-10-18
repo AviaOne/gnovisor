@@ -38,6 +38,9 @@ type Release struct {
 	// NoImageDigest leaves it null in the ledger, as before CI built it.
 	ImageDigest   string
 	NoImageDigest bool
+	// Halted fills halt_time, as gno.land does once the halt has happened on
+	// the chain (gno.land/pkg/upgrades/ledger.go, Entry). Upgrade only.
+	Halted bool
 }
 
 // ImageRepo is the repository of the gnoland image in the fake registry.
@@ -285,6 +288,10 @@ func (f *Fixture) Ledger(n int) []byte {
 			h := r.HaltHeight
 			p := int64(i)
 			e.HaltHeight, e.Proposal = &h, &p
+			if r.Halted {
+				ht := time.Date(2026, 9, 12, 15, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Hour).Format(time.RFC3339)
+				e.HaltTime = &ht
+			}
 		}
 		entries = append(entries, e)
 	}

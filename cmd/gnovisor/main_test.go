@@ -13,6 +13,7 @@ import (
 	"testing"
 
 	"github.com/AviaOne/gnovisor/internal/config"
+	"github.com/AviaOne/gnovisor/internal/docker"
 	"github.com/AviaOne/gnovisor/internal/layout"
 	"github.com/AviaOne/gnovisor/internal/local"
 	"github.com/AviaOne/gnovisor/internal/testutil"
@@ -194,5 +195,55 @@ func TestVersionShowsTheAttribution(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Errorf("version output lacks %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestInitDockerPullsTheImage(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	f := testutil.NewFixture(t, "test-1",
+		&testutil.Release{Kind: "genesis", Version: "v1.5.0", Binary: []byte("bin-1.5.0")},
+	)
+	dir := t.TempDir()
+	ledgerFile := filepath.Join(dir, "upgrades.json")
+	if err := os.WriteFile(ledgerFile, f.Ledger(-1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	digest := f.Releases[0].ImageDigest
+	fake := filepath.Join(dir, "docker")
+	script := "#!/bin/sh\necho \"$@\" >> " + filepath.Join(dir, "calls") + "\n" +
+		"case \"$1\" in pull) touch " + filepath.Join(dir, "pulled") + ";; image) test -f " + filepath.Join(dir, "pulled") + " || exit 1; case \"$*\" in *RepoDigests*) echo '[\"ghcr.io/" + testutil.ImageRepo + "@" + digest + "\"]';; *) echo id;; esac;; esac\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	initDocker = docker.Client{Bin: fake}
+	t.Cleanup(func() { initDocker = docker.Client{} })
+
+	home := t.TempDir()
+	for name, args := range map[string][]string{
+		"docker with -binary": {"-binary", "x", "-gnoroot", "y"},
+		"unknown runtime":     {"-version", "v1.5.0", "-runtime", "podman"},
+	} {
+		a := append([]string{"-home", home, "-chain-id", "test-1", "-ledger-url", ledgerFile, "-runtime", "docker"}, args...)
+		if err := cmdInit(a); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	if err := cmdInit([]string{"-home", home, "-chain-id", "test-1", "-ledger-url", ledgerFile, "-runtime", "docker", "-version", "v1.5.0"}); err != nil {
+		t.Fatal(err)
+	}
+	lay := layout.New(home)
+	info, err := layout.Verify(lay.Genesis())
+	if err != nil || !info.Docker() || info.ImageRef != "ghcr.io/"+testutil.ImageRepo+"@"+digest {
+		t.Fatalf("%+v %v", info, err)
+	}
+	b, _ := os.ReadFile(filepath.Join(lay.Root, config.FileName))
+	if !strings.Contains(string(b), `runtime = "docker"`) {
+		t.Fatalf("template:\n%s", b)
+	}
+	calls, _ := os.ReadFile(filepath.Join(dir, "calls"))
+	if !strings.Contains(string(calls), "pull --quiet ghcr.io/"+testutil.ImageRepo+"@"+digest) {
+		t.Fatalf("calls:\n%s", calls)
 	}
 }

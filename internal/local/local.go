@@ -34,9 +34,12 @@ type Entry struct {
 	HaltHeight int64 `json:"halt_height"`
 	// Now installs a rolling version at the next poll instead of waiting
 	// for rolling_window.
-	Now    bool      `json:"now"`
-	SHA256 string    `json:"sha256"`
-	Added  time.Time `json:"added"`
+	Now    bool   `json:"now"`
+	SHA256 string `json:"sha256"`
+	// Image is the image of a version added for a node run in a container,
+	// pinned by digest (repository@sha256:...); empty for a binary.
+	Image string    `json:"image,omitempty"`
+	Added time.Time `json:"added"`
 }
 
 // File is local-upgrades.json.

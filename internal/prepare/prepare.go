@@ -27,6 +27,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/AviaOne/gnovisor/internal/docker"
 	"github.com/AviaOne/gnovisor/internal/image"
 	"github.com/AviaOne/gnovisor/internal/layout"
 	"github.com/AviaOne/gnovisor/internal/ledger"
@@ -44,6 +45,10 @@ type Options struct {
 	HTTPClient   *http.Client // nil: a client with a 30 minute timeout
 	Registry     string       // image registry, image.DefaultRegistry when empty
 	Log          func(format string, args ...any)
+	// Docker is set for a node run in a container (decision D17): a version
+	// is then the gnoland image the ledger names, pulled by docker, and
+	// nothing is extracted or cloned.
+	Docker *docker.Client
 }
 
 func (o Options) logf(format string, args ...any) {
@@ -56,6 +61,9 @@ func (o Options) logf(format string, args ...any) {
 // written last: its presence is what makes a directory a ready version, so
 // an interrupted preparation never leaves a half-ready one.
 func Version(ctx context.Context, l layout.Layout, e *ledger.Entry, o Options) (string, error) {
+	if o.Docker != nil {
+		return versionImage(ctx, l, e, o)
+	}
 	_, release, err := e.Binary(o.Platform)
 	if err != nil {
 		return "", err
@@ -144,6 +152,16 @@ func Into(ctx context.Context, dir string, e *ledger.Entry, o Options) (layout.I
 	info := layout.Info{Version: e.Version, Commit: e.Commit}
 	if _, err := os.Lstat(dir); err == nil {
 		return info, fmt.Errorf("%s already exists", dir)
+	}
+	if o.Docker != nil {
+		info, err := pullImage(ctx, e, o)
+		if err != nil {
+			return info, err
+		}
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return info, err
+		}
+		return info, layout.WriteInfo(dir, info)
 	}
 	var err error
 	if info.SHA256, info.Image, err = fromImage(ctx, e, o, layout.Binary(dir)); err != nil {
@@ -245,4 +263,93 @@ func cloneAt(ctx context.Context, repo, tag, commit, dst string) error {
 		return fmt.Errorf("tag %s of %s is commit %s, the ledger says %s", tag, repo, got, commit)
 	}
 	return nil
+}
+
+// versionImage makes e ready for a node run in a container: its image
+// pulled by docker, and a version directory holding version.json alone.
+func versionImage(ctx context.Context, l layout.Layout, e *ledger.Entry, o Options) (string, error) {
+	if dir := l.VersionDir(e.Version); dir != "" {
+		i, err := layout.ReadInfo(dir)
+		if err != nil {
+			return "", err
+		}
+		if !i.Docker() {
+			return "", fmt.Errorf("%s is prepared as a binary, and runtime is docker", dir)
+		}
+		if i.Commit != e.Commit {
+			return "", fmt.Errorf("%s: prepared from commit %s, the ledger says %s", dir, i.Commit, e.Commit)
+		}
+		if e.Image.Digest == nil || *e.Image.Digest == i.Image {
+			if o.Docker.Has(ctx, i.ImageRef) {
+				return dir, nil
+			}
+			// The image was removed from the machine: pulled again by the
+			// same digest.
+			o.logf("%s: image %s is no longer on this machine; pulling it again", e.Version, i.ImageRef)
+			if err := o.Docker.Pull(ctx, i.ImageRef); err != nil {
+				return "", err
+			}
+			return dir, nil
+		}
+		if dir != l.Upgrade(e.Version) {
+			return "", fmt.Errorf("%s: image %s, the ledger now gives %s", dir, i.Image, *e.Image.Digest)
+		}
+		// The ledger names another image for this version than the one read
+		// by its tag ahead of the halt: prepared again from it.
+		o.logf("%s: image %s, the ledger now gives %s; preparing it again", dir, i.Image, *e.Image.Digest)
+	}
+	info, err := pullImage(ctx, e, o)
+	if err != nil {
+		return "", err
+	}
+	dir := l.Upgrade(e.Version)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	if err := layout.WriteInfo(dir, info); err != nil {
+		return "", err
+	}
+	o.logf("prepared %s in %s, image %s", e.Version, dir, info.ImageRef)
+	return dir, nil
+}
+
+// pullImage pulls the image of e, by the digest the ledger gives, or by its
+// tag while the ledger gives none (gno.land never re-pushes a version tag,
+// RELEASING.md), and returns the version.json of a container version, the
+// image pinned by the digest docker read.
+func pullImage(ctx context.Context, e *ledger.Entry, o Options) (layout.Info, error) {
+	info := layout.Info{Version: e.Version, Commit: e.Commit, Runtime: layout.RuntimeDocker}
+	base, _, _ := strings.Cut(e.Image.Ref, "@")
+	if i := strings.LastIndex(base, ":"); i > strings.LastIndex(base, "/") {
+		base = base[:i]
+	}
+	ref := e.Image.Ref
+	if e.Image.Digest != nil {
+		ref = base + "@" + *e.Image.Digest
+	}
+	if !o.Docker.Has(ctx, ref) {
+		if !o.AutoDownload {
+			return info, fmt.Errorf("%s: image %s is not on this machine and auto_download is off: pull it with docker", e.Version, ref)
+		}
+		if err := o.Docker.Pull(ctx, ref); err != nil {
+			return info, fmt.Errorf("%s: %w", e.Version, err)
+		}
+	}
+	repo, err := image.Repo(e.Image.Ref)
+	if err != nil {
+		return info, err
+	}
+	digest, err := o.Docker.Digest(ctx, ref, repo)
+	if err != nil {
+		return info, err
+	}
+	if e.Image.Digest != nil && digest != *e.Image.Digest {
+		return info, fmt.Errorf("%s: docker read image %s, the ledger gives %s", e.Version, digest, *e.Image.Digest)
+	}
+	if e.Image.Digest == nil {
+		o.logf("the ledger gives no image digest for %s yet: image read by its tag, digest %s", e.Version, digest)
+	}
+	info.Image, info.ImageRef = digest, base+"@"+digest
+	o.logf("pulled image %s for %s", info.ImageRef, e.Version)
+	return info, nil
 }

@@ -14,6 +14,8 @@ package config
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -46,6 +48,31 @@ type Config struct {
 	HaltConfirm    time.Duration
 	RestartTimeout time.Duration
 	RollingWindow  Window
+	// Runtime is how the node runs: RuntimeBinary, or RuntimeDocker for a
+	// node in a container, from the gnoland image of each version (D17).
+	Runtime string
+	// Docker mode only: the docker command, the container name, and extra
+	// arguments for "docker run" (volumes for files outside the node
+	// directory, for example).
+	DockerBin  string
+	Container  string
+	DockerArgs []string
+}
+
+// Runtimes.
+const (
+	RuntimeBinary = "binary"
+	RuntimeDocker = "docker"
+)
+
+// Docker reports whether the node runs in a container.
+func (c *Config) Docker() bool { return c.Runtime == RuntimeDocker }
+
+// DefaultContainer names the container of a node: one per node directory,
+// so that two nodes of the same chain on one machine never share a name.
+func DefaultContainer(chainID, nodeDir string) string {
+	sum := sha256.Sum256([]byte(filepath.Clean(nodeDir)))
+	return "gnovisor-" + chainID + "-" + hex.EncodeToString(sum[:])[:8]
 }
 
 // LedgerURLFor is the raw ledger of a chain on the chain/mainnet branch of
@@ -101,6 +128,8 @@ func Parse(data []byte) (*Config, error) {
 		ShutdownGrace:  2 * time.Minute,
 		HaltConfirm:    30 * time.Second,
 		RestartTimeout: 10 * time.Minute,
+		Runtime:        RuntimeBinary,
+		DockerBin:      "docker",
 	}
 	var errs []string
 	seen := map[string]bool{}
@@ -144,15 +173,20 @@ func Parse(data []byte) (*Config, error) {
 		*dst = d
 	}
 
-	str("node_dir", &c.NodeDir)
-	if v, ok := values["node_args"]; ok {
-		seen["node_args"] = true
+	list := func(k string, dst *[]string) {
+		v, ok := values[k]
+		if !ok {
+			return
+		}
+		seen[k] = true
 		a, ok := v.([]string)
 		if !ok {
-			errs = append(errs, "node_args: expected an array of strings")
+			errs = append(errs, k+": expected an array of strings")
 		}
-		c.NodeArgs = a
+		*dst = a
 	}
+	str("node_dir", &c.NodeDir)
+	list("node_args", &c.NodeArgs)
 	str("chain_id", &c.ChainID)
 	str("rpc", &c.RPC)
 	str("ledger_url", &c.LedgerURL)
@@ -166,6 +200,10 @@ func Parse(data []byte) (*Config, error) {
 	duration("restart_timeout", &c.RestartTimeout)
 	var window string
 	str("rolling_window", &window)
+	str("runtime", &c.Runtime)
+	str("docker", &c.DockerBin)
+	str("container_name", &c.Container)
+	list("docker_args", &c.DockerArgs)
 
 	for k := range values {
 		if !seen[k] {
@@ -192,6 +230,20 @@ func Parse(data []byte) (*Config, error) {
 		if c.LedgerURL == "" && c.ChainID != "" {
 			errs = append(errs, "ledger_url: required, no default for chain "+c.ChainID)
 		}
+	}
+	switch c.Runtime {
+	case RuntimeBinary:
+		for _, k := range []string{"docker", "container_name", "docker_args"} {
+			if seen[k] {
+				errs = append(errs, k+`: only with runtime = "docker"`)
+			}
+		}
+	case RuntimeDocker:
+		if c.Container == "" && c.ChainID != "" && c.NodeDir != "" {
+			c.Container = DefaultContainer(c.ChainID, c.NodeDir)
+		}
+	default:
+		errs = append(errs, `runtime: "binary" or "docker"`)
 	}
 	if window == "" {
 		// No default: one value shared by every operator would restart their
@@ -375,7 +427,18 @@ func parseString(s string) (string, string, error) {
 }
 
 // Template is the gnovisor.toml written by `gnovisor init`, to complete.
-func Template(nodeDir, chainID string) string {
+// runtime is RuntimeBinary or RuntimeDocker.
+func Template(nodeDir, chainID, runtime string) string {
+	docker := ""
+	if runtime == RuntimeDocker {
+		docker = fmt.Sprintf(`
+# Docker mode: the docker command, the container name, and extra arguments
+# for "docker run", such as a volume for a genesis file outside node_dir.
+# docker          = "docker"
+# container_name  = %q
+# docker_args     = ["--volume", "/path/to/genesis.json:/path/to/genesis.json:ro"]
+`, DefaultContainer(chainID, nodeDir))
+	}
 	return fmt.Sprintf(`# GnoVisor configuration. Every key is described in the README.
 
 node_dir = %q
@@ -385,6 +448,10 @@ node_args = ["--chainid", %q, "--genesis", "/path/to/genesis.json", "--skip-gene
 
 chain_id = %q
 
+# How the node runs: "binary", or "docker" for a node in a container, from
+# the official gnoland image of each version.
+runtime = %q
+%s
 # RPC of the supervised node.
 rpc = "http://127.0.0.1:26657"
 
@@ -401,5 +468,5 @@ rolling_window = ""
 # shutdown_grace  = "2m"
 # halt_confirm    = "30s"
 # restart_timeout = "10m"
-`, nodeDir, chainID, chainID, LedgerURLFor(chainID), DefaultGnorootRepo)
+`, nodeDir, chainID, chainID, runtime, docker, LedgerURLFor(chainID), DefaultGnorootRepo)
 }

@@ -15,7 +15,9 @@
 //     a halt (decision D4);
 //   - a halt_height can also come from the node's own config.toml; such a
 //     local halt matches no chain parameter and no ledger entry, and is not
-//     an upgrade.
+//     an upgrade;
+//   - only a vote stops the chain (decision D15): a halt height the ledger
+//     announces with no vote behind it is not a halt, and the node goes on.
 package supervisor
 
 import (
@@ -30,6 +32,7 @@ import (
 
 	"github.com/AviaOne/gnovisor/internal/backup"
 	"github.com/AviaOne/gnovisor/internal/config"
+	"github.com/AviaOne/gnovisor/internal/docker"
 	"github.com/AviaOne/gnovisor/internal/layout"
 	"github.com/AviaOne/gnovisor/internal/ledger"
 	"github.com/AviaOne/gnovisor/internal/local"
@@ -83,7 +86,16 @@ func (s *Supervisor) prepOpts() prepare.Options {
 		HTTPClient:   s.HTTPClient,
 		Registry:     s.Registry,
 		Log:          s.Log,
+		Docker:       s.docker(),
 	}
+}
+
+// docker is the docker client in Docker mode, nil for a binary.
+func (s *Supervisor) docker() *docker.Client {
+	if !s.Cfg.Docker() {
+		return nil
+	}
+	return &docker.Client{Bin: s.Cfg.DockerBin}
 }
 
 // Run supervises until ctx is cancelled (SIGTERM or SIGINT) or the node
@@ -166,12 +178,27 @@ func (s *Supervisor) loadCurrent() error {
 	if err != nil {
 		return fmt.Errorf("current version refused: %w", err)
 	}
+	if info.Docker() != s.Cfg.Docker() {
+		return fmt.Errorf("current version %s is prepared for runtime %q, gnovisor.toml says %q", info.Version, map[bool]string{true: config.RuntimeDocker, false: config.RuntimeBinary}[info.Docker()], s.Cfg.Runtime)
+	}
 	s.current, s.currentDir = info, dir
 	return nil
 }
 
 func (s *Supervisor) start() error {
-	n, err := startNode(s.currentDir, s.Layout.Home, s.Cfg.NodeArgs)
+	var n *node
+	var err error
+	if d := s.docker(); d != nil {
+		// A container left by a GnoVisor that ended without stopping it
+		// would keep the name, and a second gnoland on the same node
+		// directory: it is removed first.
+		if err := d.Remove(context.Background(), s.Cfg.Container); err != nil {
+			return fmt.Errorf("removing container %s: %w", s.Cfg.Container, err)
+		}
+		n, err = startContainer(d, s.Cfg.Container, s.current.ImageRef, s.Layout.Home, s.Cfg.DockerArgs, s.Cfg.NodeArgs)
+	} else {
+		n, err = startNode(s.currentDir, s.Layout.Home, s.Cfg.NodeArgs)
+	}
 	if err != nil {
 		return fmt.Errorf("start %s: %w", s.current.Version, err)
 	}
@@ -320,20 +347,26 @@ func (s *Supervisor) step(ctx context.Context) error {
 	}
 
 	if h := st.Height; h > 0 && h != s.state.LastHalt {
-		// At the height of a halt the chain or the ledger names, block h is
-		// committed and the node produces nothing more (ADR pr5368): there
-		// is nothing to confirm, and waiting would only lengthen the outage
-		// (G12). halt_confirm is kept for a node that stops elsewhere.
-		_, inLedger := s.ledgerUpgradeAt(h)
-		_, inLocal := s.localAt(h)
-		if halt.Height == h || inLedger || inLocal {
+		// A halt is a vote on the chain (decision D15): the chain stops only
+		// where GovDAO set halt_height, and the ledger only names the version
+		// that runs after it. A ledger entry, or a version added by hand, at
+		// a height no vote set is no halt: the chain goes on, and so does the
+		// node. The one exception is a halt the ledger records as past
+		// (halt_time is null until the halt has happened,
+		// gno.land/pkg/upgrades/ledger.go, Entry): a node replaying the
+		// chain stops there, whatever halt the chain parameter names today.
+		// At a halt, block h is committed and the node produces nothing more
+		// (ADR pr5368): there is nothing to confirm, and waiting would only
+		// lengthen the outage (G12). halt_confirm is kept for a node that
+		// stops elsewhere.
+		if halt.Height == h || s.pastLedgerHalt(h) {
 			s.logf("halt reached at height %d", h)
 			return s.handleHalt(ctx, h)
 		}
 		if time.Since(s.lastChange) >= s.Cfg.HaltConfirm {
 			if s.warnedLocal != h {
 				s.warnedLocal = h
-				s.logf("node stays at height %d, which is neither the chain halt nor a ledger halt: not an upgrade, nothing done", h)
+				s.logf("node stays at height %d, which is neither a halt voted on the chain nor a past halt of the ledger: not an upgrade, nothing done", h)
 			}
 			return nil
 		}
@@ -345,11 +378,14 @@ func (s *Supervisor) step(ctx context.Context) error {
 	return nil
 }
 
-func (s *Supervisor) ledgerUpgradeAt(h int64) (*ledger.Entry, bool) {
+// pastLedgerHalt reports whether the ledger records a halt at h that has
+// already happened on the chain.
+func (s *Supervisor) pastLedgerHalt(h int64) bool {
 	if s.ledger == nil {
-		return nil, false
+		return false
 	}
-	return s.ledger.UpgradeAt(h)
+	e, ok := s.ledger.UpgradeAt(h)
+	return ok && e.HaltTime != nil
 }
 
 // target returns the version to run after the halt at h: the newest of
@@ -462,6 +498,15 @@ func (s *Supervisor) localDir(e local.Entry) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	if info.Docker() != s.Cfg.Docker() {
+		return "", fmt.Errorf("%s was added for runtime %q, gnovisor.toml says %q", e.Version, map[bool]string{true: config.RuntimeDocker, false: config.RuntimeBinary}[info.Docker()], s.Cfg.Runtime)
+	}
+	if info.Docker() {
+		if info.ImageRef != e.Image {
+			return "", fmt.Errorf("%s has image %s, add-upgrade recorded %s", dir, info.ImageRef, e.Image)
+		}
+		return dir, nil
+	}
 	if info.SHA256 != e.SHA256 {
 		return "", fmt.Errorf("%s has sha256 %s, add-upgrade recorded %s", dir, info.SHA256, e.SHA256)
 	}
@@ -474,6 +519,17 @@ func (s *Supervisor) sameAsOfficial(e local.Entry, official string) error {
 	oe, ok := s.ledger.Entry(official)
 	if !ok {
 		return fmt.Errorf("ledger entry %s missing", official)
+	}
+	if s.Cfg.Docker() {
+		_, digest, _ := strings.Cut(e.Image, "@")
+		if oe.Image.Digest == nil || e.Version != official || digest != *oe.Image.Digest {
+			gives := "no image digest yet"
+			if oe.Image.Digest != nil {
+				gives = "image " + *oe.Image.Digest
+			}
+			return fmt.Errorf("the ledger gives %s (%s), the version added by hand is %s (image %s)", official, gives, e.Version, e.Image)
+		}
+		return nil
 	}
 	_, sha, err := oe.Binary(s.Platform)
 	if err != nil {

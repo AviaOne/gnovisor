@@ -8,7 +8,8 @@ Cosmovisor.
 GnoVisor starts your `gnoland` node, watches the chain for a coordinated halt
 programmed by GovDAO, prepares the new version ahead of time, and at the halt
 backs the node up, switches it to the new version and starts it again, with no
-one at the keyboard. It serves gno.land only. It is written from scratch, in
+one at the keyboard. The node runs from a binary, or in a Docker container from
+the official image of each version. It serves gno.land only. It is written from scratch, in
 Go, with no dependency outside the Go standard library, and published by
 [AviaOne.com](https://aviaone.com).
 
@@ -88,9 +89,17 @@ stopped, and GnoVisor never goes back to the old version.**
 
 And a few things GnoVisor deliberately leaves alone:
 
+- **A halt height with no vote behind it.** Only a GovDAO vote stops the
+  chain; the ledger names the version that runs after a voted halt. When the
+  ledger, or a version added by hand, announces a halt height that no vote
+  set, or one a later vote moved or cancelled, the chain goes on and GnoVisor
+  leaves the node running on its version. A halt the ledger records as past
+  (with its `halt_time`) is the exception: a node syncing from genesis stops
+  there, and GnoVisor takes it across.
 - **A node stopped by its own configuration**, a `halt_height` in
-  `config.toml` for example, matches neither the chain parameter nor the
-  ledger. GnoVisor logs a warning and touches nothing: it is not an upgrade.
+  `config.toml` for example, matches neither a voted halt nor a past halt of
+  the ledger. GnoVisor logs a warning and touches nothing: it is not an
+  upgrade.
 - **`secrets/` is never copied** into a backup. A copy of the validator key
   restored somewhere else is a double sign waiting to happen.
 - **A backup is never deleted**, and an existing one is never overwritten.
@@ -512,6 +521,69 @@ its own service.
 
 ---
 
+## Running the node in Docker
+
+GnoVisor can also supervise a node that runs in a Docker container, from the
+official `gnoland` image gno.land publishes for every version
+(`ghcr.io/gnolang/gno/gnoland:<version>`). Everything else is the same as
+for a node run from a binary: the ledger, the vote, the preparation ahead of
+the halt, the backup, the switch, the commands. GnoVisor stays a binary on
+the machine; at a voted halt it stops the container and starts the image of
+the new version instead of the new binary.
+
+The image is gno.land's own: it holds `gnoland` and its `GNOROOT` at the same
+version, so nothing is extracted or cloned. GnoVisor pulls it by the digest
+the ledger gives, or by its tag while the ledger gives none yet, and pins it
+by the digest Docker read.
+
+### What changes from the Linux installation
+
+- **Docker is required**, and the user that runs GnoVisor must be allowed to
+  use it (member of the `docker` group):
+
+  ```bash
+  sudo usermod -aG docker ${NODE_USER}
+  ```
+
+- **Step 3**: initialise with `-runtime docker`. GnoVisor pulls the image of
+  `${GNO_VERSION}` instead of fetching a binary and a `GNOROOT`:
+
+  ```bash
+  sudo -u ${NODE_USER} gnovisor init -home ${NODE_HOME} -chain-id ${CHAIN_ID} -version ${GNO_VERSION} -runtime docker
+  ```
+
+- **Step 4**: `gnovisor.toml` holds `runtime = "docker"`. `node_args` are the
+  same as for a binary. The container sees the node directory at the same
+  path, and nothing else: a file outside it, such as a genesis file, is
+  mounted through `docker_args`, for example
+  `docker_args = ["--volume", "/home/gnoland/genesis.json:/home/gnoland/genesis.json:ro"]`.
+- **Step 5**: stop and disable the service or the container that runs the
+  node today. The GnoVisor unit is the same.
+
+### How the container runs
+
+- One container per node, named `gnovisor-<chain id>-<8 hex>` by default
+  (`container_name` to change it). A container of that name left by an
+  earlier run is removed before the node starts.
+- `--network host`: the node keeps the RPC and p2p addresses it has in its
+  `config.toml`.
+- `--user`: the user that runs GnoVisor, so the files of the node directory
+  stay that user's.
+- The container is started attached: the node's output goes to GnoVisor's log
+  as with a binary, and the container is removed when it stops.
+- Stopping GnoVisor stops the container (`docker stop`, SIGTERM then SIGKILL
+  after `shutdown_grace`).
+
+A version added by hand (see [Adding a version by hand](#adding-a-version-by-hand))
+is given as an image, pinned by digest, instead of a binary and a `GNOROOT`:
+
+```bash
+sudo -u ${NODE_USER} gnovisor add-upgrade -home ${NODE_HOME} \
+  -version v1.6.1 -image registry.example/gnoland@sha256:<digest> -halt 250000
+```
+
+---
+
 ## Where the binary comes from
 
 For every version, the gno.land ledger names two builds of `gnoland`: the
@@ -598,8 +670,12 @@ for a default.
 | `backup` | `true` | back up the node directory before every switch |
 | `backup_dir` | `backups` | where backups go, relative to `gnovisor/` or absolute |
 | `shutdown_grace` | `2m` | time between SIGTERM and SIGKILL when stopping the node |
-| `halt_confirm` | `30s` | time without a new block, at a height that is neither the chain's halt nor a ledger halt, before GnoVisor reports a node stopped by its own configuration. A known halt is handled at once |
+| `halt_confirm` | `30s` | time without a new block, at a height that is neither a halt voted on the chain nor a past halt of the ledger, before GnoVisor reports a node stopped by its own configuration. A voted halt is handled at once |
 | `restart_timeout` | `10m` | longest wait for the first block after a switch, and for the RPC at start |
+| `runtime` | `binary` | `binary`, or `docker` for a node run in a container (see [Running the node in Docker](#running-the-node-in-docker)) |
+| `docker` | `docker` | Docker mode only: the docker command |
+| `container_name` | `gnovisor-<chain id>-<8 hex>` | Docker mode only: the name of the node's container, one per node directory |
+| `docker_args` | none | Docker mode only: extra arguments for `docker run`, as a list of strings, such as a `--volume` for a file outside the node directory |
 
 Durations are written as `"30s"`, `"2m"`, `"1h"`.
 
@@ -611,15 +687,17 @@ and the last valid one is kept.
 ### Commands
 
 ```
-gnovisor init     -home <dir> -chain-id <id> -version <vX.Y.Z> [-ledger-url <url|file>]
-                                 the usual way: binary from the official image, GNOROOT cloned
+gnovisor init     -home <dir> -chain-id <id> -version <vX.Y.Z> [-runtime docker] [-ledger-url <url|file>]
+                                 the usual way: binary from the official image, GNOROOT cloned;
+                                 with -runtime docker, the image itself, run in a container
 gnovisor init     -home <dir> -chain-id <id> -binary <gnoland> -gnoroot <dir> [-ledger-url <url|file>]
                                  from a release binary and a GNOROOT you already have
 gnovisor run      -home <dir>    run and supervise the node, the ExecStart of the service
 gnovisor status   -home <dir>    version in service, last halt, node height, programmed halt
 gnovisor prepare  -home <dir>    prepare the version of the programmed halt now
 gnovisor add-upgrade -home <dir> -version <vX.Y.Z> -binary <gnoland> -gnoroot <dir> (-halt <height> | -rolling [-now])
-                                 add a version the ledger does not list
+                                 add a version the ledger does not list; in Docker mode,
+                                 -image <repository@sha256:...> instead of -binary and -gnoroot
 gnovisor version                 print the version of GnoVisor
 ```
 
@@ -646,12 +724,15 @@ The tests include the real ledgers of `gnoland-1` and `onyx-1`, every ledger
 rule gno.land's own tests check, and a full simulation with a fake node that
 produces blocks and stops at a halt with its RPC open, as a real one does:
 scheduled halt, missing version, restart of GnoVisor with a pending halt, sync
-from genesis across several halts, local halt, failed restart, failed backup,
+from genesis across several halts, a halt height the ledger or a version added
+by hand announces with no vote behind it, local halt, failed restart, failed backup,
 crash of the node, rolling release inside and outside its window, versions
 added by hand (at a pending halt, ahead of a halt, in conflict with the
 ledger, rolling with and without `-now`), a wrong chain, an image digest the
 ledger does not give yet, another digest named later, and a version replaced
-in the ledger shortly before the halt. A fake registry serves the images as ghcr.io
+in the ledger shortly before the halt, and the same in Docker mode through a fake
+docker command (halt switching the image, halt with no vote, image read by its
+tag, container left behind, image added by hand). A fake registry serves the images as ghcr.io
 does (anonymous token, redirect to storage, index with an attestation
 manifest), and a tampered layer is refused.
 

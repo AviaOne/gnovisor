@@ -12,6 +12,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/AviaOne/gnovisor/internal/docker"
 	"github.com/AviaOne/gnovisor/internal/layout"
 )
 
@@ -21,6 +22,10 @@ type node struct {
 	done    chan struct{}
 	err     error
 	stopped bool // GnoVisor asked it to stop
+	// Docker mode: the container the docker client runs, stopped through
+	// docker so that the container never outlives a stop.
+	container string
+	dock      *docker.Client
 }
 
 // startNode runs <dir>/bin/gnoland start --data-dir <home> <args> with
@@ -49,6 +54,27 @@ func startNode(dir, home string, args []string) (*node, error) {
 	return n, nil
 }
 
+// startContainer runs gnoland start --data-dir <home> <args> in the image of
+// a version, in a container named name (decision D17). The image carries its
+// own GNOROOT. The docker client stays attached: its output is the node's,
+// and its exit is the container's.
+func startContainer(d *docker.Client, name, image, home string, extra, args []string) (*node, error) {
+	argv := append([]string{"start", "--data-dir", home}, args...)
+	cmd := d.Run(name, image, os.Getuid(), os.Getgid(), home, extra, argv)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	n := &node{cmd: cmd, done: make(chan struct{}), container: name, dock: d}
+	go func() {
+		n.err = cmd.Wait()
+		close(n.done)
+	}()
+	return n, nil
+}
+
 func withoutGnoroot(env []string) []string {
 	out := env[:0:0]
 	for _, kv := range env {
@@ -69,6 +95,21 @@ func (n *node) stop(grace time.Duration) error {
 	case <-n.done:
 		return nil
 	default:
+	}
+	if n.container != "" {
+		// docker stop sends SIGTERM to gnoland, then SIGKILL after grace;
+		// the attached client exits with the container.
+		err := n.dock.Stop(n.container, grace)
+		select {
+		case <-n.done:
+		case <-time.After(time.Minute):
+			_ = n.cmd.Process.Kill()
+			<-n.done
+		}
+		if err != nil {
+			return fmt.Errorf("stopping container %s: %w", n.container, err)
+		}
+		return nil
 	}
 	if err := n.cmd.Process.Signal(syscall.SIGTERM); err != nil && !errors.Is(err, os.ErrProcessDone) {
 		return err

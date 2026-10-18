@@ -119,7 +119,7 @@ func TestLoadChecksHomeAndTemplateParses(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(home, "gnovisor"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	tpl := strings.Replace(Template(home, "gnoland-1"), `rolling_window = ""`, `rolling_window = "05:00-06:00"`, 1)
+	tpl := strings.Replace(Template(home, "gnoland-1", RuntimeBinary), `rolling_window = ""`, `rolling_window = "05:00-06:00"`, 1)
 	if err := os.WriteFile(filepath.Join(home, "gnovisor", FileName), []byte(tpl), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -134,7 +134,37 @@ func TestLoadChecksHomeAndTemplateParses(t *testing.T) {
 		t.Fatal("a missing file must fail")
 	}
 	// The template as written must fail until rolling_window is filled.
-	if _, err := Parse([]byte(Template(home, "gnoland-1"))); err == nil || !strings.Contains(err.Error(), "rolling_window") {
+	if _, err := Parse([]byte(Template(home, "gnoland-1", RuntimeBinary))); err == nil || !strings.Contains(err.Error(), "rolling_window") {
 		t.Fatalf("template without a window: %v", err)
+	}
+}
+
+func TestDockerRuntime(t *testing.T) {
+	c, err := Parse([]byte(minimal + `runtime = "docker"` + "\n" + `docker_args = ["--volume", "/srv:/srv:ro"]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Docker() || c.DockerBin != "docker" || c.Container != DefaultContainer("gnoland-1", "/srv/gno") ||
+		!slices.Equal(c.DockerArgs, []string{"--volume", "/srv:/srv:ro"}) {
+		t.Fatalf("%+v", c)
+	}
+	if !strings.HasPrefix(c.Container, "gnovisor-gnoland-1-") || DefaultContainer("gnoland-1", "/srv/gno") == DefaultContainer("gnoland-1", "/srv/gno2") {
+		t.Fatal("one container name per node directory")
+	}
+	if c, _ := Parse([]byte(minimal)); c.Docker() || c.Runtime != RuntimeBinary {
+		t.Fatal("the default runtime is binary")
+	}
+	for name, text := range map[string]string{
+		"bad runtime":            minimal + `runtime = "podman"`,
+		"docker key for binary":  minimal + `container_name = "x"`,
+		"docker args for binary": minimal + `docker_args = ["-v"]`,
+	} {
+		if _, err := Parse([]byte(text)); err == nil {
+			t.Errorf("%s: accepted", name)
+		}
+	}
+	tpl := strings.Replace(Template("/srv/gno", "gnoland-1", RuntimeDocker), `rolling_window = ""`, `rolling_window = "05:00-06:00"`, 1)
+	if c, err := Parse([]byte(tpl)); err != nil || !c.Docker() {
+		t.Fatalf("docker template: %v", err)
 	}
 }

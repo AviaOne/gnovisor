@@ -59,9 +59,21 @@ type Info struct {
 	Commit  string `json:"commit"`
 	SHA256  string `json:"sha256"`
 	// Image is the digest of the ledger's image the binary was taken from,
-	// empty for a binary that is the ledger's release download.
+	// empty for a binary that is the ledger's release download. For a
+	// version run in a container, the digest of its image.
 	Image string `json:"image,omitempty"`
+	// Runtime is "docker" for a version run in a container (decision D17):
+	// the directory then holds only version.json, and ImageRef is the image
+	// to run, pinned by digest. Empty for a binary.
+	Runtime  string `json:"runtime,omitempty"`
+	ImageRef string `json:"image_ref,omitempty"`
 }
+
+// RuntimeDocker marks a version run in a container.
+const RuntimeDocker = "docker"
+
+// Docker reports whether the version runs in a container.
+func (i Info) Docker() bool { return i.Runtime == RuntimeDocker }
 
 // ReadInfo reads dir/version.json.
 func ReadInfo(dir string) (Info, error) {
@@ -73,8 +85,13 @@ func ReadInfo(dir string) (Info, error) {
 	if err := json.Unmarshal(b, &i); err != nil {
 		return i, fmt.Errorf("%s: %w", infoFile(dir), err)
 	}
-	if i.Version == "" || i.SHA256 == "" {
-		return i, fmt.Errorf("%s: version or sha256 missing", infoFile(dir))
+	switch {
+	case i.Version == "":
+		return i, fmt.Errorf("%s: version missing", infoFile(dir))
+	case i.Docker() && (i.ImageRef == "" || i.Image == ""):
+		return i, fmt.Errorf("%s: image_ref or image missing", infoFile(dir))
+	case !i.Docker() && i.SHA256 == "":
+		return i, fmt.Errorf("%s: sha256 missing", infoFile(dir))
 	}
 	return i, nil
 }
@@ -103,10 +120,11 @@ func SHA256File(path string) (string, error) {
 }
 
 // Verify checks that dir's binary still has the digest version.json
-// recorded.
+// recorded. A version run in a container has no file to check here: docker
+// checks its image against the digest it is pulled and run by.
 func Verify(dir string) (Info, error) {
 	i, err := ReadInfo(dir)
-	if err != nil {
+	if err != nil || i.Docker() {
 		return i, err
 	}
 	got, err := SHA256File(Binary(dir))
