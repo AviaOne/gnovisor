@@ -523,11 +523,11 @@ its own service.
 
 ## Installation with Docker
 
-For a node that runs in a Docker container. GnoVisor itself is the same
-`gnovisor` binary as in the Linux installation, installed on the machine:
-there is no separate download and no Docker image of GnoVisor. What runs in
-Docker is the node, from the official `gnoland` image gno.land publishes for
-every version, `ghcr.io/gnolang/gno/gnoland:<version>`. At a voted halt,
+For a node that runs in a Docker container. GnoVisor is the same download for
+both modes, installed on the machine. It does not contain the node: in Docker
+mode, the node runs from the official gnoland image published by gno.land for
+each version, `ghcr.io/gnolang/gno/gnoland:<version>`, which GnoVisor pulls at
+every update. At a voted halt,
 GnoVisor stops the container and starts the image of the new version, where
 the Linux installation starts the new binary. Everything else works the same:
 the ledger, the vote, the preparation ahead of the halt, the backup, the
