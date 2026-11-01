@@ -17,7 +17,12 @@
 //     local halt matches no chain parameter and no ledger entry, and is not
 //     an upgrade;
 //   - only a vote stops the chain (decision D15): a halt height the ledger
-//     announces with no vote behind it is not a halt, and the node goes on.
+//     announces with no vote behind it is not a halt, and the node goes on;
+//   - since 2026-10-29 gno.land writes the ledger entry of a coordinated
+//     upgrade only once the chain runs the release, after the halt
+//     (gno.land/adr/pr6381_ledger_entry_after_upgrade.md), and every halt
+//     proposal sets the version released as halt_min_version (RELEASING.md):
+//     the vote names the version (decision D18).
 package supervisor
 
 import (
@@ -72,8 +77,36 @@ type Supervisor struct {
 	lastHeight  int64
 	lastChange  time.Time
 	prepared    map[int64]bool
+	prepTried   map[string]time.Time
 	rollingDir  map[string]string
 	warnedLocal int64
+}
+
+// Where the version run after a voted halt comes from, in the order GnoVisor
+// takes it.
+const (
+	SourceHand   = "added by hand"
+	SourceLedger = "ledger"
+	SourceVote   = "named by the vote"
+)
+
+// VersionForHalt returns the version to run after the voted halt at h, and
+// where it comes from: a version added by hand wins (decision D19), then the
+// ledger's entry for that halt, then the version the vote set as its floor
+// (decision D18). It returns "" when none is known.
+func VersionForHalt(l *ledger.Ledger, f local.File, h int64, floor string) (string, string) {
+	if e, ok := f.AtHalt(h); ok {
+		return e.Version, SourceHand
+	}
+	if l != nil {
+		if e, ok := l.UpgradeAt(h); ok {
+			return e.Version, SourceLedger
+		}
+	}
+	if e, ok := ledger.Voted(floor, h); ok {
+		return e.Version, SourceVote
+	}
+	return "", ""
 }
 
 func (s *Supervisor) logf(format string, args ...any) { s.Log(format, args...) }
@@ -103,6 +136,7 @@ func (s *Supervisor) docker() *docker.Client {
 func (s *Supervisor) Run(ctx context.Context) error {
 	s.rpc = rpc.New(s.Cfg.RPC)
 	s.prepared = map[int64]bool{}
+	s.prepTried = map[string]time.Time{}
 	s.rollingDir = map[string]string{}
 	var err error
 	if s.state, err = s.Layout.ReadState(); err != nil {
@@ -118,7 +152,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		// The node halted at Pending.Height and its version was not ready.
 		// Starting it on the old binary could resume the chain (D4).
 		s.logf("halt at height %d is pending, the node stays stopped until its version is ready", s.state.Pending.Height)
-		if err := s.handleHalt(ctx, s.state.Pending.Height); err != nil {
+		if err := s.handleHalt(ctx, s.state.Pending.Height, s.state.Pending.MinVersion); err != nil {
 			if errors.Is(err, context.Canceled) {
 				s.stopNode()
 				return nil
@@ -325,25 +359,8 @@ func (s *Supervisor) step(ctx context.Context) error {
 	}
 
 	scheduled := halt.Height > st.Height
-	if scheduled && !s.prepared[halt.Height] && s.ledger != nil {
-		if e, ok := s.ledger.UpgradeAt(halt.Height); ok {
-			if _, err := prepare.Version(ctx, s.Layout, e, s.prepOpts()); err != nil {
-				s.logf("preparing %s for the halt at height %d: %v", e.Version, halt.Height, err)
-			} else {
-				s.prepared[halt.Height] = true
-				s.logf("ready for the halt at height %d, version %s", halt.Height, e.Version)
-			}
-		} else if e, ok := s.localAt(halt.Height); ok {
-			if _, err := s.localDir(e); err != nil {
-				s.logf("version %s added by hand for the halt at height %d: %v", e.Version, halt.Height, err)
-			} else {
-				s.prepared[halt.Height] = true
-				s.logf("ready for the halt at height %d, version %s added by hand", halt.Height, e.Version)
-			}
-		} else if time.Since(s.ledgerAt) < s.Cfg.PollInterval {
-			// Once per ledger read (section 7.2).
-			s.logf("halt programmed at height %d, no ledger entry for it yet", halt.Height)
-		}
+	if scheduled && !s.prepared[halt.Height] {
+		s.prepareAhead(ctx, halt)
 	}
 
 	if h := st.Height; h > 0 && h != s.state.LastHalt {
@@ -361,7 +378,11 @@ func (s *Supervisor) step(ctx context.Context) error {
 		// stops elsewhere.
 		if halt.Height == h || s.pastLedgerHalt(h) {
 			s.logf("halt reached at height %d", h)
-			return s.handleHalt(ctx, h)
+			floor := ""
+			if halt.Height == h {
+				floor = halt.MinVersion
+			}
+			return s.handleHalt(ctx, h, floor)
 		}
 		if time.Since(s.lastChange) >= s.Cfg.HaltConfirm {
 			if s.warnedLocal != h {
@@ -372,9 +393,98 @@ func (s *Supervisor) step(ctx context.Context) error {
 		}
 	}
 
+	if err := s.maybeLedgerFix(ctx, st.Height); err != nil {
+		return err
+	}
 	if !scheduled && !st.CatchingUp {
 		return s.maybeRolling(ctx, st.Height)
 	}
+	return nil
+}
+
+// tried reports whether a preparation of version failed less than
+// PendingLedgerInterval ago, so that a version not yet published is looked
+// for once a minute, not at every poll.
+func (s *Supervisor) tried(version string) bool {
+	t, ok := s.prepTried[version]
+	return ok && time.Since(t) < PendingLedgerInterval
+}
+
+// prepareAhead prepares the version of the voted halt, before it is reached,
+// from the source VersionForHalt gives.
+func (s *Supervisor) prepareAhead(ctx context.Context, halt rpc.Halt) {
+	h := halt.Height
+	if loc, ok := s.localAt(h); ok {
+		if _, err := s.localDir(loc); err != nil {
+			s.logf("version %s added by hand for the halt at height %d: %v", loc.Version, h, err)
+			return
+		}
+		s.prepared[h] = true
+		s.logf("ready for the halt at height %d, version %s added by hand", h, loc.Version)
+		return
+	}
+	var e *ledger.Entry
+	how := ""
+	if s.ledger != nil {
+		e, _ = s.ledger.UpgradeAt(h)
+	}
+	if e == nil {
+		if v, ok := ledger.Voted(halt.MinVersion, h); ok {
+			e, how = v, " named by the vote"
+		}
+	}
+	if e == nil {
+		if time.Since(s.ledgerAt) < s.Cfg.PollInterval {
+			// Once per ledger read (section 7.2).
+			s.logf("halt programmed at height %d, with no version in the vote and no ledger entry yet", h)
+		}
+		return
+	}
+	if s.tried(e.Version) {
+		return
+	}
+	if _, err := prepare.Version(ctx, s.Layout, e, s.prepOpts()); err != nil {
+		s.prepTried[e.Version] = time.Now()
+		s.logf("preparing %s for the halt at height %d: %v", e.Version, h, err)
+		return
+	}
+	s.prepared[h] = true
+	s.logf("ready for the halt at height %d, version %s%s", h, e.Version, how)
+}
+
+// maybeLedgerFix follows the ledger written after the last halt (decision
+// D21): when it names, for the blocks after that halt, a newer version than
+// the one in service, gno.land runs that one, such as a fix of a version
+// that produces no block, and GnoVisor switches to it. The vote only sets a
+// floor, and the node itself refuses a version below it. A version added by
+// hand for that halt is never replaced (decision D19).
+func (s *Supervisor) maybeLedgerFix(ctx context.Context, height int64) error {
+	h := s.state.LastHalt
+	if h == 0 || s.ledger == nil || s.node == nil {
+		return nil
+	}
+	r, ok := s.target(h)
+	if !ok || r.Serves(s.current.Version) {
+		return nil
+	}
+	if _, ok := s.localAt(h); ok {
+		return nil
+	}
+	newest := r.Newest()
+	if semver.Compare(newest, s.current.Version) <= 0 || s.tried(newest) {
+		return nil
+	}
+	e, _ := s.ledger.Entry(newest)
+	dir, err := prepare.Version(ctx, s.Layout, e, s.prepOpts())
+	if err == nil {
+		var info layout.Info
+		if info, err = layout.Verify(dir); err == nil {
+			s.logf("the ledger names %s for the blocks after %d, not %s: switching", newest, h, s.current.Version)
+			return s.switchTo(ctx, h, dir, info, height+1)
+		}
+	}
+	s.prepTried[newest] = time.Now()
+	s.logf("the ledger names %s for the blocks after %d, not ready: %v", newest, h, err)
 	return nil
 }
 
@@ -403,29 +513,27 @@ func (s *Supervisor) target(h int64) (ledger.Range, bool) {
 }
 
 // handleHalt takes the node across the halt at h (sections 7.3 and 7.4).
-// The node may be running (halted) or already stopped (pending halt).
-func (s *Supervisor) handleHalt(ctx context.Context, h int64) error {
+// The node may be running (halted) or already stopped (pending halt). floor
+// is the halt_min_version the vote set, "" for a past halt of the ledger.
+// The version run is, in order: the one added by hand for this halt (D19),
+// the one the ledger names for the blocks after it, the one the vote names
+// (D18).
+func (s *Supervisor) handleHalt(ctx context.Context, h int64, floor string) error {
+	if err := s.setPending(h, floor); err != nil {
+		return err
+	}
 	// The ledger is read again now: the one in memory can be up to
 	// LedgerInterval old, and gno.land may have named another version for
 	// this halt in the meantime (a last-minute fix is a new tag).
 	s.refreshLedger(ctx, true)
 	for {
 		r, ok := s.target(h)
-		loc, hasLoc := s.localAt(h)
-		if ok && hasLoc {
-			if err := s.sameAsOfficial(loc, r.Newest()); err != nil {
-				// Two sources disagree on what runs after this halt, and
-				// nothing tells which one is right: no switch (D9).
-				s.logf("halt at height %d: %v; no switch, the node stays stopped", h, err)
-				if err := s.waitPending(ctx, h); err != nil {
-					return err
-				}
-				continue
-			}
-		}
-		if !ok && hasLoc {
+		if loc, hasLoc := s.localAt(h); hasLoc {
 			dir, err := s.localDir(loc)
 			if err == nil {
+				if ok && r.Newest() != loc.Version {
+					s.logf("halt at height %d: the ledger gives %s, the version added by hand, %s, is the one run", h, r.Newest(), loc.Version)
+				}
 				info, _ := layout.ReadInfo(dir)
 				s.logf("halt at height %d: using version %s added by hand", h, loc.Version)
 				return s.switchTo(ctx, h, dir, info, h+1)
@@ -436,14 +544,20 @@ func (s *Supervisor) handleHalt(ctx context.Context, h int64) error {
 			}
 			continue
 		}
-		if ok && r.Serves(s.current.Version) {
+		var e *ledger.Entry
+		switch v, voted := ledger.Voted(floor, h); {
+		case ok && r.Serves(s.current.Version), !ok && voted && v.Version == s.current.Version:
 			// Already on a version that serves the next blocks: a restart
 			// is enough (section 7.4).
 			s.logf("version %s serves the blocks after %d, restarting the node", s.current.Version, h)
 			return s.switchTo(ctx, h, s.currentDir, s.current, h+1)
+		case ok:
+			e, _ = s.ledger.Entry(r.Newest())
+		case voted:
+			s.logf("no ledger entry for the halt at height %d: version %s named by the vote", h, v.Version)
+			e = v
 		}
-		if ok {
-			e, _ := s.ledger.Entry(r.Newest())
+		if e != nil {
 			dir, err := prepare.Version(ctx, s.Layout, e, s.prepOpts())
 			if err == nil {
 				info, err := layout.Verify(dir)
@@ -453,7 +567,7 @@ func (s *Supervisor) handleHalt(ctx context.Context, h int64) error {
 			}
 			s.logf("version %s for the halt at height %d is not ready: %v", e.Version, h, err)
 		} else {
-			s.logf("no ledger entry for the halt at height %d yet: the node stays stopped, the old binary is never restarted", h)
+			s.logf("no version for the halt at height %d, neither in the vote nor in the ledger: the node stays stopped, the old binary is never restarted", h)
 		}
 		if err := s.waitPending(ctx, h); err != nil {
 			return err
@@ -466,7 +580,7 @@ func (s *Supervisor) handleHalt(ctx context.Context, h int64) error {
 // added by hand is read at every pass, so `gnovisor add-upgrade` run during
 // the wait is taken within a minute.
 func (s *Supervisor) waitPending(ctx context.Context, h int64) error {
-	if err := s.setPending(h); err != nil {
+	if err := s.setPending(h, ""); err != nil {
 		return err
 	}
 	s.stopNode()
@@ -513,39 +627,13 @@ func (s *Supervisor) localDir(e local.Entry) (string, error) {
 	return dir, nil
 }
 
-// sameAsOfficial reports whether a version added by hand is the one the
-// ledger gives for the same halt, binary included.
-func (s *Supervisor) sameAsOfficial(e local.Entry, official string) error {
-	oe, ok := s.ledger.Entry(official)
-	if !ok {
-		return fmt.Errorf("ledger entry %s missing", official)
-	}
-	if s.Cfg.Docker() {
-		_, digest, _ := strings.Cut(e.Image, "@")
-		if oe.Image.Digest == nil || e.Version != official || digest != *oe.Image.Digest {
-			gives := "no image digest yet"
-			if oe.Image.Digest != nil {
-				gives = "image " + *oe.Image.Digest
-			}
-			return fmt.Errorf("the ledger gives %s (%s), the version added by hand is %s (image %s)", official, gives, e.Version, e.Image)
-		}
+// setPending records the halt at h as pending, with the floor the vote set;
+// an empty floor keeps the one already recorded for that halt.
+func (s *Supervisor) setPending(h int64, floor string) error {
+	if p := s.state.Pending; p != nil && p.Height == h && (floor == "" || floor == p.MinVersion) {
 		return nil
 	}
-	_, sha, err := oe.Binary(s.Platform)
-	if err != nil {
-		return err
-	}
-	if e.Version != official || e.SHA256 != sha {
-		return fmt.Errorf("the ledger gives %s (sha256 %s), the version added by hand is %s (sha256 %s)", official, sha, e.Version, e.SHA256)
-	}
-	return nil
-}
-
-func (s *Supervisor) setPending(h int64) error {
-	if s.state.Pending != nil && s.state.Pending.Height == h {
-		return nil
-	}
-	s.state.Pending = &layout.Pending{Height: h}
+	s.state.Pending = &layout.Pending{Height: h, MinVersion: floor}
 	return s.Layout.WriteState(s.state)
 }
 
@@ -555,7 +643,7 @@ func (s *Supervisor) setPending(h int64) error {
 // and the old version directory stay for a manual intervention.
 // A switch, once started, is not interrupted by a stop request.
 func (s *Supervisor) switchTo(ctx context.Context, h int64, dir string, info layout.Info, wantHeight int64) error {
-	if err := s.setPending(h); err != nil {
+	if err := s.setPending(h, ""); err != nil {
 		return err
 	}
 	from := s.current.Version
@@ -585,7 +673,11 @@ func (s *Supervisor) switchTo(ctx context.Context, h int64, dir string, info lay
 
 // restartAndWait starts the node and waits for wantHeight within
 // restart_timeout. halt is the halt being crossed, 0 for a rolling release:
-// after a halt, a version that fails is followed by a watch for its fix.
+// after a halt, a version that exits is followed by a watch for its fix, and
+// a node that produces no block within restart_timeout keeps running
+// (decision D20): the chain may stay halted long after the switch, as on
+// onyx-1 on 2026-10-29, and the node catches up when it resumes; a fix the
+// ledger names later is taken by maybeLedgerFix (decision D21).
 func (s *Supervisor) restartAndWait(ctx context.Context, wantHeight, halt int64) error {
 	failed := func() error {
 		if halt > 0 {
@@ -617,6 +709,10 @@ func (s *Supervisor) restartAndWait(ctx context.Context, wantHeight, halt int64)
 			return err
 		}
 	}
+	if halt > 0 {
+		s.logf("no block %d within %s: the node keeps running on %s and catches up when the chain resumes", wantHeight, s.Cfg.RestartTimeout, s.current.Version)
+		return nil
+	}
 	s.logf("no block %d within %s, node stopped, no return to the old version", wantHeight, s.Cfg.RestartTimeout)
 	s.stopNode()
 	return failed()
@@ -632,7 +728,7 @@ func (s *Supervisor) restartAndWait(ctx context.Context, wantHeight, halt int64)
 // recorded as pending, so a restart of GnoVisor resumes this watch.
 func (s *Supervisor) awaitFix(ctx context.Context, h int64) error {
 	failed := s.current.Version
-	if err := s.setPending(h); err != nil {
+	if err := s.setPending(h, ""); err != nil {
 		return err
 	}
 	s.stopNode()

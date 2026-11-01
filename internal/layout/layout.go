@@ -194,6 +194,10 @@ type State struct {
 // Pending halt.
 type Pending struct {
 	Height int64 `json:"height"`
+	// MinVersion is the halt_min_version the vote set for this halt, kept
+	// because the version it names must be read while the node is stopped
+	// and its RPC closed (decision D18). Empty when the vote set no floor.
+	MinVersion string `json:"min_version,omitempty"`
 }
 
 // ReadState reads state.json; a missing file is the zero state.

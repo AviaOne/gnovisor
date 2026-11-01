@@ -44,7 +44,7 @@ commands:
            (or -binary <gnoland> -gnoroot <dir> instead of -version)
   run      -home <node dir>     run and supervise the node (systemd ExecStart)
   status   -home <node dir>     version in service, programmed halt, prepared version, last halt
-  prepare  -home <node dir>     prepare the version of the programmed halt now
+  prepare  -home <node dir>     prepare the version of the programmed halt now (from the ledger, or the vote)
   add-upgrade -home <node dir> -version <vX.Y.Z> (-binary <gnoland> -gnoroot <dir> | -image <repo@sha256:...>)
               (-halt <height> | -rolling [-now])
                                 add a version received outside the ledger (a private security fix)
@@ -434,19 +434,20 @@ func cmdStatus(args []string) error {
 		return nil
 	}
 	fmt.Printf("programmed halt:    %d, floor %q\n", halt.Height, halt.MinVersion)
+	// The same order as the supervisor: added by hand, the ledger, the vote.
 	l, err := loadLedger(ctx, cfg.LedgerURL, cfg.ChainID)
 	if err != nil {
 		fmt.Printf("ledger:             %v\n", err)
-		return nil
+		l = nil
 	}
-	e, ok := l.UpgradeAt(halt.Height)
+	v, src := supervisor.VersionForHalt(l, lf, halt.Height, halt.MinVersion)
 	switch {
-	case !ok:
-		fmt.Println("prepared version:   none, no ledger entry for this halt yet")
-	case lay.VersionDir(e.Version) != "":
-		fmt.Printf("prepared version:   %s\n", e.Version)
+	case v == "":
+		fmt.Println("prepared version:   none, no version in the vote and no ledger entry for this halt yet")
+	case lay.VersionDir(v) != "":
+		fmt.Printf("prepared version:   %s (%s)\n", v, src)
 	default:
-		fmt.Printf("prepared version:   none, %s not prepared yet\n", e.Version)
+		fmt.Printf("prepared version:   none, %s (%s) not prepared yet\n", v, src)
 	}
 	return nil
 }
@@ -477,13 +478,27 @@ func cmdPrepare(args []string) error {
 	if halt.Height <= s.Height {
 		return errors.New("no halt programmed")
 	}
-	l, err := loadLedger(ctx, cfg.LedgerURL, cfg.ChainID)
+	lay := layout.New(h)
+	lf, err := local.Read(lay)
 	if err != nil {
 		return err
 	}
-	e, ok := l.UpgradeAt(halt.Height)
-	if !ok {
-		return fmt.Errorf("no ledger entry for the halt at height %d yet", halt.Height)
+	l, lerr := loadLedger(ctx, cfg.LedgerURL, cfg.ChainID)
+	if lerr != nil {
+		logf("ledger: %v", lerr)
+		l = nil
+	}
+	var e *ledger.Entry
+	switch v, src := supervisor.VersionForHalt(l, lf, halt.Height, halt.MinVersion); src {
+	case supervisor.SourceHand:
+		logf("%s was added by hand for the halt at height %d: nothing to prepare", v, halt.Height)
+		return nil
+	case supervisor.SourceLedger:
+		e, _ = l.UpgradeAt(halt.Height)
+	case supervisor.SourceVote:
+		e, _ = ledger.Voted(halt.MinVersion, halt.Height)
+	default:
+		return fmt.Errorf("no version in the vote and no ledger entry for the halt at height %d yet", halt.Height)
 	}
 	o := prepare.Options{
 		Platform: platform(), AutoDownload: cfg.AutoDownload, GnorootRepo: cfg.GnorootRepo, Log: logf,
@@ -491,7 +506,7 @@ func cmdPrepare(args []string) error {
 	if cfg.Docker() {
 		o.Docker = &docker.Client{Bin: cfg.DockerBin}
 	}
-	dir, err := prepare.Version(ctx, layout.New(h), e, o)
+	dir, err := prepare.Version(ctx, lay, e, o)
 	if err != nil {
 		return err
 	}

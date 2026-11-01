@@ -3,7 +3,8 @@
 // Additional terms under section 7 of the AGPL-3.0: see NOTICE.md.
 
 // Package prepare makes a version ready to run: its gnoland binary and its
-// GNOROOT, both checked against the ledger.
+// GNOROOT, both checked against the ledger, or, for a version known only from
+// the vote (decision D18), taken at its tag.
 //
 // A version needs both: the node reads GNOROOT/gnovm/stdlibs
 // (gno.land/pkg/gnoland/app.go), and VALIDATOR.md asks for a GNOROOT at the
@@ -64,9 +65,15 @@ func Version(ctx context.Context, l layout.Layout, e *ledger.Entry, o Options) (
 	if o.Docker != nil {
 		return versionImage(ctx, l, e, o)
 	}
-	_, release, err := e.Binary(o.Platform)
-	if err != nil {
-		return "", err
+	// A version known only from the vote has no ledger checksum: its binary
+	// is the one of its official image, read by tag.
+	release := ""
+	if !e.FromVote() {
+		_, sha, err := e.Binary(o.Platform)
+		if err != nil {
+			return "", err
+		}
+		release = sha
 	}
 	if dir := l.VersionDir(e.Version); dir != "" {
 		i, err := layout.Verify(dir)
@@ -98,6 +105,9 @@ func Version(ctx context.Context, l layout.Layout, e *ledger.Entry, o Options) (
 	info := layout.Info{Version: e.Version, Commit: e.Commit}
 	deposited := layout.Binary(dir)
 	if _, err := os.Stat(deposited); err == nil {
+		if release == "" {
+			return "", fmt.Errorf("%s: no ledger checksum to check the binary in %s against; give it with gnovisor add-upgrade", e.Version, deposited)
+		}
 		// A binary the operator put there has priority (decision of
 		// 2026-10-05), but only with the ledger's digest.
 		got, err := layout.SHA256File(deposited)
@@ -132,9 +142,11 @@ func Version(ctx context.Context, l layout.Layout, e *ledger.Entry, o Options) (
 		}
 	}
 
-	if err := gnoroot(ctx, o, e, dir); err != nil {
+	commit, err := gnoroot(ctx, o, e, dir)
+	if err != nil {
 		return "", err
 	}
+	info.Commit = commit
 	if err := layout.WriteInfo(dir, info); err != nil {
 		return "", err
 	}
@@ -167,7 +179,7 @@ func Into(ctx context.Context, dir string, e *ledger.Entry, o Options) (layout.I
 	if info.SHA256, info.Image, err = fromImage(ctx, e, o, layout.Binary(dir)); err != nil {
 		return info, err
 	}
-	if err := gnoroot(ctx, o, e, dir); err != nil {
+	if info.Commit, err = gnoroot(ctx, o, e, dir); err != nil {
 		return info, err
 	}
 	if err := layout.WriteInfo(dir, info); err != nil {
@@ -177,9 +189,11 @@ func Into(ctx context.Context, dir string, e *ledger.Entry, o Options) (layout.I
 	return info, err
 }
 
-// matches checks a prepared version against its ledger entry.
+// matches checks a prepared version against its ledger entry. A commit or
+// a checksum that one side does not know (a version known only from the
+// vote) cannot be compared.
 func matches(i layout.Info, e *ledger.Entry, release string) error {
-	if i.Commit != e.Commit {
+	if e.Commit != "" && i.Commit != "" && i.Commit != e.Commit {
 		return fmt.Errorf("prepared from commit %s, the ledger says %s", i.Commit, e.Commit)
 	}
 	if i.Image != "" {
@@ -190,7 +204,7 @@ func matches(i layout.Info, e *ledger.Entry, release string) error {
 		}
 		return nil
 	}
-	if i.SHA256 != release {
+	if release != "" && i.SHA256 != release {
 		return fmt.Errorf("binary sha256 %s, the ledger says %s", i.SHA256, release)
 	}
 	return nil
@@ -225,44 +239,47 @@ func fromImage(ctx context.Context, e *ledger.Entry, o Options, dst string) (str
 
 // gnoroot puts in dir a git copy of the GNOROOT at the tag, its commit
 // compared with the ledger (decision D1: the ledger publishes no digest of a
-// source archive).
-func gnoroot(ctx context.Context, o Options, e *ledger.Entry, dir string) error {
+// source archive), and returns that commit. A version known only from the
+// vote has no commit to compare: the tag gives it.
+func gnoroot(ctx context.Context, o Options, e *ledger.Entry, dir string) (string, error) {
 	if err := os.RemoveAll(layout.Gnoroot(dir)); err != nil {
-		return err
+		return "", err
 	}
 	tmpRoot, err := os.MkdirTemp(dir, ".gnoroot.tmp-")
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer func() { _ = os.RemoveAll(tmpRoot) }()
-	if err := cloneAt(ctx, o.GnorootRepo, e.Version, e.Commit, tmpRoot); err != nil {
-		return err
+	commit, err := cloneAt(ctx, o.GnorootRepo, e.Version, e.Commit, tmpRoot)
+	if err != nil {
+		return "", err
 	}
-	return os.Rename(tmpRoot, layout.Gnoroot(dir))
+	return commit, os.Rename(tmpRoot, layout.Gnoroot(dir))
 }
 
-// cloneAt copies repo at tag into dst and checks that the tag points at
-// commit.
-func cloneAt(ctx context.Context, repo, tag, commit, dst string) error {
+// cloneAt copies repo at tag into dst, checks that the tag points at commit
+// when one is given, and returns the commit of the tag.
+func cloneAt(ctx context.Context, repo, tag, commit, dst string) (string, error) {
 	if _, err := exec.LookPath("git"); err != nil {
-		return errors.New("git is required to prepare a GNOROOT and was not found")
+		return "", errors.New("git is required to prepare a GNOROOT and was not found")
 	}
 	if err := os.RemoveAll(dst); err != nil {
-		return err
+		return "", err
 	}
 	out, err := exec.CommandContext(ctx, "git", "-c", "advice.detachedHead=false",
 		"clone", "--quiet", "--depth", "1", "--single-branch", "--branch", tag, "--", repo, dst).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("git clone %s at %s: %v: %s", repo, tag, err, strings.TrimSpace(string(out)))
+		return "", fmt.Errorf("git clone %s at %s: %v: %s", repo, tag, err, strings.TrimSpace(string(out)))
 	}
 	out, err = exec.CommandContext(ctx, "git", "-C", dst, "rev-parse", "HEAD").Output()
 	if err != nil {
-		return fmt.Errorf("git rev-parse in %s: %w", dst, err)
+		return "", fmt.Errorf("git rev-parse in %s: %w", dst, err)
 	}
-	if got := strings.TrimSpace(string(out)); got != commit {
-		return fmt.Errorf("tag %s of %s is commit %s, the ledger says %s", tag, repo, got, commit)
+	got := strings.TrimSpace(string(out))
+	if commit != "" && got != commit {
+		return "", fmt.Errorf("tag %s of %s is commit %s, the ledger says %s", tag, repo, got, commit)
 	}
-	return nil
+	return got, nil
 }
 
 // versionImage makes e ready for a node run in a container: its image
@@ -276,7 +293,7 @@ func versionImage(ctx context.Context, l layout.Layout, e *ledger.Entry, o Optio
 		if !i.Docker() {
 			return "", fmt.Errorf("%s is prepared as a binary, and runtime is docker", dir)
 		}
-		if i.Commit != e.Commit {
+		if e.Commit != "" && i.Commit != "" && i.Commit != e.Commit {
 			return "", fmt.Errorf("%s: prepared from commit %s, the ledger says %s", dir, i.Commit, e.Commit)
 		}
 		if e.Image.Digest == nil || *e.Image.Digest == i.Image {

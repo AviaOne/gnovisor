@@ -40,6 +40,9 @@ type control struct {
 	HaltMinVersion string              `json:"halt_min_version"`
 	Ranges         map[string][2]int64 `json:"ranges"` // version -> [from, to], to 0 = open
 	Crash          bool                `json:"crash"`
+	// CrashVersion makes the node of that version exit at once, as a
+	// version that refuses to start.
+	CrashVersion string `json:"crash_version"`
 }
 
 func TestMain(m *testing.M) {
@@ -120,7 +123,7 @@ func fakeNode() int {
 			return 0
 		case <-tick.C:
 			c := readControl(ctrl)
-			if c.Crash {
+			if c.Crash || (c.CrashVersion != "" && c.CrashVersion == version) {
 				return 3
 			}
 			r, ok := c.Ranges[version]
@@ -599,8 +602,8 @@ func TestLocalHaltIsNotAnUpgrade(t *testing.T) {
 func TestFailedRestartLeavesTheNodeStoppedWithoutGoingBack(t *testing.T) {
 	h := newHarness(t, 2, rel("genesis", "v1.5.0", 0), rel("upgrade", "v1.6.0", 30))
 	h.cfg.RestartTimeout = 500 * time.Millisecond
-	// v1.6.0 refuses to produce block 31, as a node refused by its floor.
-	h.setControl(func(c *control) { c.HaltHeight = 30; c.Ranges["v1.6.0"] = [2]int64{50, 0} })
+	// v1.6.0 exits at once after the halt, as a node refused by its floor.
+	h.setControl(func(c *control) { c.HaltHeight = 30; c.CrashVersion = "v1.6.0" })
 	h.run()
 	h.waitFor("failure", func() bool { return h.logged("no return to the old version") })
 	h.waitFor("watch for a fix", func() bool { return h.logged("waiting for a version other than v1.6.0") })
@@ -616,9 +619,9 @@ func TestFailedRestartLeavesTheNodeStoppedWithoutGoingBack(t *testing.T) {
 }
 
 func TestFixPublishedAfterAFailedVersionIsTaken(t *testing.T) {
-	// v1.6.0 runs after the halt but produces no block (an app hash
-	// mismatch); gno.land publishes v1.6.1 and names it in the ledger for
-	// the same halt. GnoVisor, still watching, switches to it.
+	// v1.6.0 exits after the halt (it refuses to start); gno.land publishes
+	// v1.6.1 and names it in the ledger for the same halt. GnoVisor, still
+	// watching, switches to it.
 	old := PendingLedgerInterval
 	PendingLedgerInterval = 200 * time.Millisecond
 	t.Cleanup(func() { PendingLedgerInterval = old })
@@ -629,7 +632,7 @@ func TestFixPublishedAfterAFailedVersionIsTaken(t *testing.T) {
 	h.setControl(func(c *control) {
 		c.HaltHeight = 30
 		c.Ranges["v1.5.0"] = [2]int64{1, 30}
-		c.Ranges["v1.6.0"] = [2]int64{1000, 0} // never produces block 31
+		c.CrashVersion = "v1.6.0"
 		c.Ranges["v1.6.1"] = [2]int64{31, 0}
 	})
 	h.run()
@@ -803,22 +806,27 @@ func TestVersionAddedByHandBeforeTheHaltIsReadyAhead(t *testing.T) {
 	h.waitFor("switch", func() bool { return h.chainHeight() >= 32 })
 }
 
-func TestLedgerAndHandDisagreeingBlocksTheSwitch(t *testing.T) {
-	old := PendingLedgerInterval
-	PendingLedgerInterval = 200 * time.Millisecond
-	t.Cleanup(func() { PendingLedgerInterval = old })
-
+func TestVersionAddedByHandWinsOverTheLedgerAndTheVote(t *testing.T) {
+	// D19: for one halt, the version added by hand is the one run, whatever
+	// the ledger or the vote names.
 	h := newHarness(t, 2, rel("genesis", "v1.5.0", 0), rel("upgrade", "v1.6.0", 30))
-	h.setControl(func(c *control) { c.HaltHeight = 30; c.Ranges["v1.6.5"] = [2]int64{31, 0} })
+	h.cfg.Backup = false
+	h.setControl(func(c *control) {
+		c.HaltHeight, c.HaltMinVersion = 30, "v1.6.0"
+		c.Ranges["v1.6.5"] = [2]int64{31, 0}
+	})
 	h.addLocal("v1.6.5", 30, false)
 	h.run()
-	h.waitFor("conflict reported", func() bool { return h.logged("the ledger gives v1.6.0") })
-	time.Sleep(500 * time.Millisecond)
-	if h.currentVersion() != "v1.5.0" || len(h.nodeStarts()) != 1 {
-		t.Fatalf("no switch on a conflict: current %s, runs %v", h.currentVersion(), h.nodeStarts())
+	h.waitFor("ready ahead", func() bool { return h.logged("ready for the halt at height 30, version v1.6.5 added by hand") })
+	h.waitFor("switch", func() bool { return h.chainHeight() >= 32 })
+	if v := h.currentVersion(); v != "v1.6.5" {
+		t.Fatalf("current = %s", v)
 	}
-	if s := h.state(); s.Pending == nil || s.Pending.Height != 30 {
-		t.Fatalf("the halt must stay pending: %+v", s)
+	if starts := h.nodeStarts(); strings.Join(starts, ",") != "v1.5.0,v1.6.5" {
+		t.Fatalf("node runs = %v", starts)
+	}
+	if !h.logged("the ledger gives v1.6.0") {
+		t.Fatal("the difference with the ledger must be logged")
 	}
 }
 

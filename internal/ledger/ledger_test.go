@@ -274,3 +274,16 @@ func TestSchemaDescribesTheStructs(t *testing.T) {
 	check(reflect.TypeOf(Ledger{}), schema.Properties)
 	check(reflect.TypeOf(Entry{}), schema.Defs.Entry.Properties)
 }
+
+func TestVoted(t *testing.T) {
+	e, ok := Voted("v1.7.0-rc.1", 754000)
+	if !ok || e.Version != "v1.7.0-rc.1" || e.Kind != KindUpgrade || *e.HaltHeight != 754000 ||
+		e.Image.Ref != "ghcr.io/gnolang/gno/gnoland:v1.7.0-rc.1" || e.Image.Digest != nil || !e.FromVote() {
+		t.Fatalf("entry = %+v %v", e, ok)
+	}
+	for _, bad := range []string{"", "1.7.0", "v1.7", "latest"} {
+		if _, ok := Voted(bad, 1); ok {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+}

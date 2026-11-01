@@ -224,3 +224,41 @@ func TestIntoFillsANewDirectory(t *testing.T) {
 		t.Fatal("an existing directory must be refused")
 	}
 }
+
+func TestVotedVersionTakesTheCommitOfItsTag(t *testing.T) {
+	// D18: a version known only from the vote has no ledger commit nor
+	// checksum. Its GNOROOT is cloned at the tag and its commit recorded, so
+	// that the ledger entry written after the halt is checked against it.
+	f, l, lay, o := setup(t)
+	v, ok := ledger.Voted("v1.6.0", 100)
+	if !ok {
+		t.Fatal("v1.6.0 refused")
+	}
+	dir, err := Version(context.Background(), lay, v, o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	i, err := layout.ReadInfo(dir)
+	if err != nil || i.Commit != f.Releases[1].Commit || i.Image != f.Releases[1].ImageDigest {
+		t.Fatalf("version.json = %+v %v", i, err)
+	}
+	e, _ := l.Entry("v1.6.0")
+	if again, err := Version(context.Background(), lay, e, o); err != nil || again != dir {
+		t.Fatalf("the ledger entry must match the version prepared from the vote: %s %v", again, err)
+	}
+}
+
+func TestVotedVersionRefusesAnUncheckedDepositedBinary(t *testing.T) {
+	_, _, lay, o := setup(t)
+	dep := layout.Binary(lay.Upgrade("v1.6.0"))
+	if err := os.MkdirAll(filepath.Dir(dep), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dep, []byte("unknown"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	v, _ := ledger.Voted("v1.6.0", 100)
+	if _, err := Version(context.Background(), lay, v, o); err == nil || !strings.Contains(err.Error(), "add-upgrade") {
+		t.Fatalf("err = %v", err)
+	}
+}

@@ -341,6 +341,34 @@ func (r Range) Serves(version string) bool {
 	return false
 }
 
+// Voted returns the entry of a coordinated upgrade known only from the vote:
+// the version GovDAO set as halt_min_version for the halt at h, and its
+// official image by tag. Since 2026-10-29 gno.land writes the ledger entry
+// only once the chain runs the release, after the halt
+// (gno.land/adr/pr6381_ledger_entry_after_upgrade.md), and every halt
+// proposal names the version released (RELEASING.md, "Release pages and the
+// upgrade ledger"). The commit, the image digest and the binaries are not
+// known: the GNOROOT is taken at the tag, and the image read by its tag,
+// which gno.land never re-pushes. ok is false for a version the node could
+// not parse, such as an empty floor.
+func Voted(version string, h int64) (*Entry, bool) {
+	v, ok := ParseVersion(version)
+	if !ok || v != version {
+		return nil, false
+	}
+	height := h
+	return &Entry{
+		Kind:       KindUpgrade,
+		Version:    v,
+		HaltHeight: &height,
+		Image:      Image{Ref: imagePrefix + v},
+	}, true
+}
+
+// FromVote reports whether e was built by Voted: the ledger requires a
+// commit on every entry.
+func (e *Entry) FromVote() bool { return e.Commit == "" }
+
 // Binary returns the download URL and the expected sha256 of an entry for
 // a platform ("linux/amd64").
 func (e *Entry) Binary(plat string) (url, sha string, err error) {
