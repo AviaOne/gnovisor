@@ -22,7 +22,10 @@
 //     upgrade only once the chain runs the release, after the halt
 //     (gno.land/adr/pr6381_ledger_entry_after_upgrade.md), and every halt
 //     proposal sets the version released as halt_min_version (RELEASING.md):
-//     the vote names the version (decision D18).
+//     the vote names the version (decision D18);
+//   - a node catching up in block sync does not stay up at a halt: it exits
+//     (tm2/pkg/bft/blockchain/reactor.go, a panic with no recover), often
+//     before any poll has read the halt height; exit.go takes it across.
 package supervisor
 
 import (
@@ -80,7 +83,17 @@ type Supervisor struct {
 	prepTried   map[string]time.Time
 	rollingDir  map[string]string
 	warnedLocal int64
+	// chainHalt is the halt the node last reported over RPC, kept for an
+	// exit at a halt that no later poll can read.
+	chainHalt rpc.Halt
+	// lastExit is the last exit handled by nodeExited, with the version that
+	// ran, so that the same exit twice is not acted on again.
+	lastExit string
 }
+
+// errNodeExited is returned when the node exits by itself before its RPC
+// answers.
+var errNodeExited = errors.New("node exited by itself")
 
 // Where the version run after a voted halt comes from, in the order GnoVisor
 // takes it.
@@ -162,12 +175,27 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	} else if err := s.start(); err != nil {
 		return err
 	}
-	if err := s.checkChainID(ctx); err != nil {
-		s.stopNode()
-		if errors.Is(err, context.Canceled) {
-			return nil
+	for {
+		err := s.checkChainID(ctx)
+		if errors.Is(err, errNodeExited) {
+			// It may have refused to start, or exited at a halt while
+			// catching up (exit.go).
+			var handled bool
+			if handled, err = s.nodeExited(ctx); handled && err == nil {
+				continue
+			}
+			if !handled {
+				err = fmt.Errorf("node exited by itself: %s", s.node.exitDescription())
+			}
 		}
-		return err
+		if err != nil {
+			s.stopNode()
+			if errors.Is(err, context.Canceled) {
+				return nil
+			}
+			return err
+		}
+		break
 	}
 
 	tick := time.NewTicker(s.Cfg.PollInterval)
@@ -180,6 +208,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return nil
 		case <-s.nodeDone():
 			if !s.node.stopped {
+				handled, err := s.nodeExited(ctx)
+				if handled {
+					if err != nil {
+						if errors.Is(err, context.Canceled) {
+							s.stopNode()
+							return nil
+						}
+						return err
+					}
+					continue
+				}
 				// Not restarted here: systemd restarts GnoVisor, and a loop
 				// of crashes stays visible (specification, 7.6).
 				return fmt.Errorf("node exited by itself: %s", s.node.exitDescription())
@@ -273,7 +312,7 @@ func (s *Supervisor) checkChainID(ctx context.Context) error {
 		if s.node != nil {
 			select {
 			case <-s.node.done:
-				return fmt.Errorf("node exited by itself: %s", s.node.exitDescription())
+				return fmt.Errorf("%w: %s", errNodeExited, s.node.exitDescription())
 			default:
 			}
 		}
@@ -357,6 +396,7 @@ func (s *Supervisor) step(ctx context.Context) error {
 		s.logf("reading the halt parameters: %v", err)
 		return nil
 	}
+	s.chainHalt = halt
 
 	scheduled := halt.Height > st.Height
 	if scheduled && !s.prepared[halt.Height] {
@@ -516,8 +556,9 @@ func (s *Supervisor) target(h int64) (ledger.Range, bool) {
 // The node may be running (halted) or already stopped (pending halt). floor
 // is the halt_min_version the vote set, "" for a past halt of the ledger.
 // The version run is, in order: the one added by hand for this halt (D19),
-// the one the ledger names for the blocks after it, the one the vote names
-// (D18).
+// the one in service when it is newer than the ledger's and meets the floor
+// (D26), the one the ledger names for the blocks after it, the one the vote
+// names (D18).
 func (s *Supervisor) handleHalt(ctx context.Context, h int64, floor string) error {
 	if err := s.setPending(h, floor); err != nil {
 		return err
@@ -551,6 +592,9 @@ func (s *Supervisor) handleHalt(ctx context.Context, h int64, floor string) erro
 			// is enough (section 7.4).
 			s.logf("version %s serves the blocks after %d, restarting the node", s.current.Version, h)
 			return s.switchTo(ctx, h, s.currentDir, s.current, h+1)
+		case ok && s.newerServes(h, r, floor):
+			s.logf("version %s is newer than %s, the version the ledger gives for the blocks after %d, and meets the floor of that halt: kept, restarting the node", s.current.Version, r.Newest(), h)
+			return s.switchTo(ctx, h, s.currentDir, s.current, h+1)
 		case ok:
 			e, _ = s.ledger.Entry(r.Newest())
 		case voted:
@@ -573,6 +617,33 @@ func (s *Supervisor) handleHalt(ctx context.Context, h int64, floor string) erro
 			return err
 		}
 	}
+}
+
+// newerServes reports whether the version in service may run the blocks
+// after the halt at h although the ledger gives an older one for them
+// (decision D26). gno.land syncs a node from genesis on a recent version and
+// restarts it on that same version at every past halt whose floor it meets
+// (misc/deployments/mainnet.gno.land/UPGRADES.md, "Joining from genesis",
+// branch chain/mainnet): taking the older version of the ledger instead would
+// run it on a database a newer version already wrote. The version in service
+// must be newer than the ledger's and meet both the floor the vote set and
+// the one the ledger records for that halt; otherwise the ledger's version
+// runs, as before.
+func (s *Supervisor) newerServes(h int64, r ledger.Range, floor string) bool {
+	cur := s.current.Version
+	if s.ledger == nil || semver.Compare(cur, r.Newest()) <= 0 {
+		return false
+	}
+	floors := []string{floor}
+	if e, ok := s.ledger.UpgradeAt(h); ok && e.HaltMinVersion != nil {
+		floors = append(floors, *e.HaltMinVersion)
+	}
+	for _, f := range floors {
+		if f != "" && semver.Compare(cur, f) < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // waitPending records the halt as pending, keeps the node stopped, waits
@@ -648,7 +719,14 @@ func (s *Supervisor) switchTo(ctx context.Context, h int64, dir string, info lay
 	}
 	from := s.current.Version
 	s.stopNode()
-	if s.Cfg.Backup {
+	switch {
+	case s.Cfg.Backup && s.pastLedgerHalt(h):
+		// The network crossed this halt long ago and the ledger records it:
+		// the node is catching up, its data can be fetched again, and a copy
+		// of the whole database at every past halt could fill the disk
+		// (decision D23).
+		s.logf("no backup: the halt at height %d is past for the network (ledger halt_time)", h)
+	case s.Cfg.Backup:
 		dst, err := backup.Make(s.Layout.Home, s.Cfg.BackupDir, backup.Name(h, from))
 		if err != nil {
 			s.logf("backup failed, no switch, node left stopped: %v", err)
@@ -693,6 +771,11 @@ func (s *Supervisor) restartAndWait(ctx context.Context, wantHeight, halt int64)
 	for time.Now().Before(deadline) {
 		select {
 		case <-s.node.done:
+			// A node catching up may reach the next halt, or be refused, before
+			// any block is read here (exit.go).
+			if handled, err := s.nodeExited(ctx); handled {
+				return err
+			}
 			s.logf("node exited after the switch (%s), left stopped, no return to the old version", s.node.exitDescription())
 			s.node = nil
 			return failed()
@@ -700,6 +783,7 @@ func (s *Supervisor) restartAndWait(ctx context.Context, wantHeight, halt int64)
 		}
 		if st, err := s.rpc.Status(context.Background()); err == nil && st.Height >= wantHeight {
 			s.lastHeight, s.lastChange = st.Height, time.Now()
+			s.lastExit = ""
 			s.logf("block %d seen, update succeeded", st.Height)
 			return nil
 		}

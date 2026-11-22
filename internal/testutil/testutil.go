@@ -41,6 +41,8 @@ type Release struct {
 	// Halted fills halt_time, as gno.land does once the halt has happened on
 	// the chain (gno.land/pkg/upgrades/ledger.go, Entry). Upgrade only.
 	Halted bool
+	// MinVersion is the halt_min_version the vote set. Upgrade only.
+	MinVersion string
 }
 
 // ImageRepo is the repository of the gnoland image in the fake registry.
@@ -291,6 +293,10 @@ func (f *Fixture) Ledger(n int) []byte {
 			if r.Halted {
 				ht := time.Date(2026, 9, 12, 15, 0, 0, 0, time.UTC).Add(time.Duration(i) * time.Hour).Format(time.RFC3339)
 				e.HaltTime = &ht
+			}
+			if r.MinVersion != "" {
+				mv := r.MinVersion
+				e.HaltMinVersion = &mv
 			}
 		}
 		entries = append(entries, e)

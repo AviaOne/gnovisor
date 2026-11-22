@@ -25,16 +25,19 @@ Cosmovisor does not work here, and the reasons are in the chain itself:
 | On a Cosmos chain | On gno.land | What GnoVisor does |
 |---|---|---|
 | The upgrade module writes `data/upgrade-info.json`, which Cosmovisor watches | Nothing writes that file. A halt is two chain parameters, `node:p:halt_height` and `node:p:halt_min_version`, set by a GovDAO proposal | Reads both parameters from the node's RPC |
-| The node process exits at the upgrade height | **The process stays alive at a halt.** Consensus stops, the RPC stays open, and a supervisor waiting for the process to exit waits forever | Sees a halt as a node that stays at the halt height with no new block |
+| The node process exits at the upgrade height | **A live node stays alive at a halt.** Consensus stops, the RPC stays open, and a supervisor waiting for the process to exit waits forever. **A node catching up exits there instead**, often before any query has read the halt height | Sees a halt as a node that stays at the halt height with no new block, and reads the halt from what a node catching up prints as it exits |
 | The binary is all a version needs | **A version is a binary and its `GNOROOT`.** The node reads the standard libraries from `GNOROOT/gnovm/stdlibs`, and the validator guide asks for a `GNOROOT` at the same tag as the binary | Prepares and keeps both, per version, and starts the node with the matching `GNOROOT` |
 | Upgrade plans name the binaries to download | The vote names the version: every halt proposal sets the version released as `halt_min_version`. gno.land also publishes a ledger, `misc/deployments/<chain>/upgrades.json`: every version the network ran, its commit, its halt height, one download per platform with its sha256, and its container image with its digest. Since October 2026 an entry is written only once the chain runs the release, after the halt | Takes the version the vote names and the binary of its official image, ahead of the halt. Reads the ledger for past halts, and to follow a version gno.land names after the halt |
 | An old binary is refused past the upgrade height | **With no version floor, nothing stops the old binary from resuming the chain after a halt.** Every halt on `gnoland-1` so far was set without a floor | Never starts the old binary again after a halt |
 
 It also covers two situations an operator usually handles by hand:
 
-- **Syncing from genesis stops at every past halt.** Each one fires again
-  during replay, and the node needs a restart, on the version the ledger names
-  for the blocks that follow. GnoVisor does it at each of them.
+- **Catching up stops at every past halt.** A node synced from genesis, or
+  restored from an older snapshot, meets each halt again: it exits there and
+  needs a restart. GnoVisor restarts it at each of them: on the version in
+  service when it is newer than the one the ledger names for the blocks that
+  follow and meets the floor of that halt, otherwise on the ledger's version.
+  It takes no backup at a halt the network crossed long ago.
 - **Rolling releases.** The ledger may add a patch on the same minor version,
   with no halt, that operators install when they choose. GnoVisor installs it
   inside a daily time window you set, so that validators do not all restart
@@ -98,6 +101,24 @@ old version.**
 - **The node exits by itself**, outside any update. GnoVisor logs the exit
   code and exits with an error, and systemd starts it again. It does not
   restart a crashing node itself, so that a crash loop stays visible.
+  Four exits are not crashes, and GnoVisor reads them from what the node
+  prints:
+  - **At a halt, while catching up.** The halt is handled as for a live node,
+    and written to `gnovisor/state.json` first, so a restart of GnoVisor
+    never starts the old version.
+  - **The old version refused by the version floor of a halt**, a node left
+    stopped at a halt by an earlier GnoVisor for example. GnoVisor finds the
+    halt by that floor, in the ledger or among the versions added by hand,
+    and takes it across; until it is known, the node stays stopped and the
+    ledger is read every minute.
+  - **A version meant for a later halt**, on a node restored from an older
+    snapshot. GnoVisor runs the version the ledger gives for the node's next
+    block, then crosses the halts one by one.
+  - **At the `halt_height` of its own `config.toml`**, a manual halt (see
+    below). The node stays stopped.
+
+  The same exit twice on the same version is not acted on again: GnoVisor
+  waits for another version, as after a failed update.
 
 And a few things GnoVisor deliberately leaves alone:
 
@@ -110,8 +131,16 @@ And a few things GnoVisor deliberately leaves alone:
   there, and GnoVisor takes it across.
 - **A node stopped by its own configuration**, a `halt_height` in
   `config.toml` for example, matches neither a voted halt nor a past halt of
-  the ledger. GnoVisor logs a warning and touches nothing: it is not an
-  upgrade.
+  the ledger. It is a manual halt, set on purpose (an attack, a chain
+  relaunch): it is not an upgrade, and GnoVisor never lifts it. A live node
+  stays there and GnoVisor logs a warning; a node catching up exits there,
+  and GnoVisor keeps it stopped, logs it, and starts nothing. To go on, set
+  `halt_height = 0` in `config.toml`, then restart the service: lifting a
+  manual halt is a manual act too. A `halt_height` set at the height of a voted halt, as its comment
+  in `config.toml` suggests for a coordinated upgrade, is that upgrade:
+  GnoVisor switches. The node applies `halt_height` at every start, so the
+  new version stops at the same height: GnoVisor logs it and waits. Remove
+  `halt_height` from `config.toml`, then restart the service.
 - **`secrets/` is never copied** into a backup. A copy of the validator key
   restored somewhere else is a double sign waiting to happen.
 - **A backup is never deleted**, and an existing one is never overwritten.
@@ -148,7 +177,8 @@ And a few things GnoVisor deliberately leaves alone:
 
 - **Disk space for the backups.** A backup is a full copy of the node
   directory minus `secrets/`, taken at every update, and GnoVisor never
-  deletes one. Watch the disk, or set `backup = false`.
+  deletes one. Watch the disk, or set `backup = false`. A node catching up
+  takes none at a halt the ledger records as past.
 - **No Go installation is needed.** The release binary of step 2 is
   self-contained. Go is only needed if you choose to build GnoVisor from
   source yourself (step 2, option B). GnoVisor never builds `gnoland`, so the
@@ -182,9 +212,15 @@ export GNO_VERSION=v1.5.0
 **These variables only live in the terminal you set them in.** If you close it
 or open a new one, run the `export` lines again before continuing.
 
-> **Syncing a new node from genesis?** Set `GNO_VERSION` to the genesis
-> version of the ledger, `v1.2.0` on `gnoland-1`. GnoVisor then takes the node
-> through every past halt, version by version, as the ledger describes them.
+> **Syncing a new node from genesis?** Two ways work. Set `GNO_VERSION` to
+> the genesis version of the ledger, `v1.2.0` on `gnoland-1`: GnoVisor takes
+> the node through every past halt, version by version, as the network ran
+> them. Or set it to the version the chain's validator guide (`VALIDATOR.md`
+> next to its ledger) gives for a sync from genesis: GnoVisor keeps it at
+> every past halt whose floor it meets, and switches only where a floor asks
+> for a newer version.
+> **Starting from a snapshot?** Set `GNO_VERSION` to the version that serves
+> the blocks after the snapshot's height.
 
 ### Step 2 - Install the binary
 
@@ -838,7 +874,7 @@ for a default.
 | `gnoroot_repo` | `https://github.com/gnolang/gno.git` | Git repository each `GNOROOT` is cloned from |
 | `poll_interval` | `5s` | how often the node is queried |
 | `auto_download` | `true` | download a version that is not prepared. With `false`, the binary must be deposited by hand (see [Before a halt](#before-a-halt)) |
-| `backup` | `true` | back up the node directory before every switch |
+| `backup` | `true` | back up the node directory before every switch, except at a halt the ledger records as past (with its `halt_time`), met while the node catches up |
 | `backup_dir` | `backups` | where backups go, relative to `gnovisor/` or absolute |
 | `shutdown_grace` | `2m` | time between SIGTERM and SIGKILL when stopping the node |
 | `halt_confirm` | `30s` | time without a new block, at a height that is neither a halt voted on the chain nor a past halt of the ledger, before GnoVisor reports a node stopped by its own configuration. A voted halt is handled at once |
@@ -894,7 +930,13 @@ make lint       # golangci-lint
 
 The tests include the real ledgers of `gnoland-1` and `onyx-1`, every ledger
 rule gno.land's own tests check, and a full simulation with a fake node that
-produces blocks and stops at a halt with its RPC open, as a real one does:
+produces blocks and stops at a halt with its RPC open, as a live one does, or
+exits there as a node catching up does (sync across past halts and sync on a
+newer version kept at past halts, both also in Docker mode, a voted halt
+known only from a version added by hand or from the ledger, a local halt, a
+local halt at the voted height, the old version refused by the floor with the
+halt known or not yet, a node restored from an older snapshot, the same
+refusal twice, GnoVisor restarted after the exit):
 scheduled halt, version named by the vote with no ledger entry, ledger written
 after the halt naming another version, chain slow to resume after the switch,
 missing version, restart of GnoVisor with a pending halt, sync

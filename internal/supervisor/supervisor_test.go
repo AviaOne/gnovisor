@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -43,6 +44,27 @@ type control struct {
 	// CrashVersion makes the node of that version exit at once, as a
 	// version that refuses to start.
 	CrashVersion string `json:"crash_version"`
+	// PanicAtHalt makes the node exit at the end of its version's range as a
+	// node in block sync does: the halt panic on stderr, exit status 2.
+	PanicAtHalt bool `json:"panic_at_halt"`
+	// Refuse makes the node of a version refuse to start, as
+	// checkNodeStartupParams does: the line on stderr, exit status 1.
+	Refuse map[string]refusal `json:"refuse"`
+	// LocalHalt is the halt_height of the node's config.toml: every version
+	// panics on the block after it, as BaseApp does (tm2/pkg/sdk/baseapp.go).
+	LocalHalt int64 `json:"local_halt"`
+	// Halts are the past halts a node replaying the chain meets whatever its
+	// version: it exits at one it commits after its start, as PanicAtHalt
+	// does, and goes on past it once restarted there (the halt is armed by
+	// an equality, gno.land/pkg/gnoland/app.go).
+	Halts []int64 `json:"halts"`
+}
+
+// refusal: the node of a version started at a height in [From, To] (To 0:
+// no end) writes Line and exits 1.
+type refusal struct {
+	From, To int64
+	Line     string
 }
 
 func TestMain(m *testing.M) {
@@ -76,6 +98,11 @@ func fakeNode() int {
 	height := int64(0)
 	if b, err := os.ReadFile(heightFile); err == nil {
 		height, _ = strconv.ParseInt(strings.TrimSpace(string(b)), 10, 64)
+	}
+	startHeight := height
+	if r, ok := readControl(ctrl).Refuse[version]; ok && height >= r.From && (r.To == 0 || height <= r.To) {
+		_, _ = fmt.Fprintln(os.Stderr, r.Line)
+		return 1
 	}
 	q := func(v string) string {
 		d := "null"
@@ -128,10 +155,25 @@ func fakeNode() int {
 			}
 			r, ok := c.Ranges[version]
 			mu.Lock()
+			if c.LocalHalt > 0 && height >= c.LocalHalt {
+				// Started at or past its config.toml halt: the next block's
+				// BeginBlock panics at once.
+				mu.Unlock()
+				_, _ = fmt.Fprintf(os.Stderr, "panic: halt height %d reached, node shutting down\n", c.LocalHalt)
+				return 2
+			}
 			next := height + 1
 			if ok && next >= r[0] && (r[1] == 0 || next <= r[1]) {
 				height = next
 				_ = os.WriteFile(heightFile, []byte(strconv.FormatInt(height, 10)), 0o644)
+				if (c.PanicAtHalt && r[1] != 0 && height == r[1]) || (c.LocalHalt > 0 && height == c.LocalHalt) ||
+					(height > startHeight && slices.Contains(c.Halts, height)) {
+					// In block sync the next block is applied at once and
+					// its BeginBlock panics: no poll reads this height.
+					mu.Unlock()
+					_, _ = fmt.Fprintf(os.Stderr, "panic: halt height %d reached, node shutting down\n\ngoroutine 61 [running]:\n", height)
+					return 2
+				}
 			}
 			mu.Unlock()
 		}
@@ -245,6 +287,7 @@ func newHarnessMode(t *testing.T, dockerMode bool, published int, releases ...*t
 	_ = os.WriteFile(filepath.Join(h.lay.Home, "secrets", "priv_validator_key.json"), []byte("KEY"), 0o600)
 	_ = os.MkdirAll(filepath.Join(h.lay.Home, "db"), 0o755)
 	_ = os.WriteFile(filepath.Join(h.lay.Home, "db", "data"), []byte("db"), 0o644)
+	h.setLocalHalt(0)
 
 	w, _ := config.ParseWindow("00:00-23:59")
 	h.cfg = &config.Config{
@@ -288,10 +331,24 @@ func (h *harness) publish(n int) {
 	}
 }
 
+// setLocalHalt writes the node's config.toml with this halt_height, as
+// gnoland lays it out: top-level keys first, then tables.
+func (h *harness) setLocalHalt(height int64) {
+	dir := filepath.Join(h.lay.Home, "config")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		h.t.Fatal(err)
+	}
+	cfg := fmt.Sprintf("# config\nmoniker = \"test\"\nhalt_height = %d\nskip_upgrade_height = 0\n\n[rpc]\nladdr = \"tcp://127.0.0.1:26657\"\nhalt_height = 7\n", height)
+	if err := os.WriteFile(filepath.Join(dir, "config.toml"), []byte(cfg), 0o644); err != nil {
+		h.t.Fatal(err)
+	}
+}
+
 func (h *harness) run() {
 	ctx, cancel := context.WithCancel(context.Background())
 	h.cancel = cancel
-	h.done = make(chan error, 1)
+	done := make(chan error, 1)
+	h.done = done
 	s := &Supervisor{
 		Cfg: h.cfg, Layout: h.lay, Platform: "linux/amd64", HTTPClient: h.f.Client(), Registry: h.f.Server.URL,
 		Log: func(format string, args ...any) {
@@ -300,11 +357,11 @@ func (h *harness) run() {
 			h.mu.Unlock()
 		},
 	}
-	go func() { h.done <- s.Run(ctx) }()
+	go func() { done <- s.Run(ctx) }()
 	h.t.Cleanup(func() {
 		cancel()
 		select {
-		case <-h.done:
+		case <-done:
 		case <-time.After(10 * time.Second):
 			h.t.Error("supervisor did not stop")
 		}
